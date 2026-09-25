@@ -6,6 +6,7 @@
 static constexpr int RADIAL_KERNEL_PLUMMER = 0;
 static constexpr int RADIAL_KERNEL_PLUMMER_2D = 1;
 static constexpr int RADIAL_KERNEL_SOFTENED_DISTANCE = 2;
+static constexpr int RADIAL_KERNEL_WENDLAND_C2 = 3;
 
 // scale_exp is zero for direct interactions, or bounded_expansion_exponent
 // for M2L: both 2^scale_exp and its reciprocal are normal floating-point values.
@@ -125,6 +126,71 @@ struct RadialKernel<RADIAL_KERNEL_SOFTENED_DISTANCE> {
     }
 };
 
+template<>
+struct RadialKernel<RADIAL_KERNEL_WENDLAND_C2> {
+    template<typename tvec>
+    struct Params {
+        tvec support;
+        tvec norm;
+    };
+
+    template<typename tvec>
+    __device__ __forceinline__ static Params<tvec> make_params(const tvec* params) {
+        return Params<tvec>{params[0], params[1]};
+    }
+
+    template<int p, typename tvec>
+    __device__ __forceinline__ static void r2_derivative_coeffs(
+        tvec scaled_r2,
+        Params<tvec> params,
+        Vec<p+1,tvec>& coeffs,
+        int scale_exp = 0
+    ) {
+        // s = r^2 / R^2, R = 2^scale_exp
+        // coeffs[n] = 2^n d^n/ds^n K(R sqrt(s)).
+        // With u = q^2 = s / H'^2, H' = H / R:
+        // K / norm = (1-q)^4 (1+4q) = 1 - 10u - 15u^2 + u^{3/2} (20 + 4u)  for u < 1
+        const tvec support = params.support * normal_pow2<tvec>(-scale_exp);
+        const tvec hinv2 = tvec(1) / (support * support);
+        const tvec u = scaled_r2 * hinv2;
+        // Also false for NaN, e.g. if the scaled support underflows
+        const bool inside = u < tvec(1);
+        const tvec q = sqrt(u);
+        // The half-integer powers are singular at u = 0 for n >= 2. Setting uinv = 0 there
+        // yields zero instead. It is only multiplied with dx = 0 in the pair VJP.
+        const tvec uinv = (u > tvec(0)) ? tvec(1) / u : tvec(0);
+        const tvec fac = tvec(2) * hinv2;
+
+        tvec pw3 = u * q; // u^{3/2 - n}
+        tvec pw5 = u * u * q; // u^{5/2 - n}
+        tvec c3 = tvec(20);
+        tvec c5 = tvec(4);
+        tvec scale = params.norm;
+
+        #pragma unroll
+        for(int n = 0; n <= p; n++) {
+            tvec poly;
+            if(n == 0)
+                poly = tvec(1) - u * (tvec(10) + tvec(15) * u);
+            else if(n == 1)
+                poly = tvec(-10) - tvec(30) * u;
+            else if(n == 2)
+                poly = tvec(-30);
+            else
+                poly = tvec(0);
+
+            const tvec value = scale * (poly + c3 * pw3 + c5 * pw5);
+            coeffs[n] = inside ? value : tvec(0);
+
+            c3 *= tvec(1.5) - tvec(n);
+            c5 *= tvec(2.5) - tvec(n);
+            pw3 *= uinv;
+            pw5 *= uinv;
+            scale *= fac;
+        }
+    }
+};
+
 template<int p, typename tvec>
 __device__ __forceinline__ void evaluate_radial_kernel_derivatives(
     int radial_kernel_kind,
@@ -136,6 +202,13 @@ __device__ __forceinline__ void evaluate_radial_kernel_derivatives(
     // s = scaled_r2 = r^2 / R^2, R = 2^scale_exp
     // coeffs[n] = 2^n d^n/ds^n K(R sqrt(s)).
     switch(radial_kernel_kind) {
+        case RADIAL_KERNEL_WENDLAND_C2: {
+            auto kernel_params = RadialKernel<RADIAL_KERNEL_WENDLAND_C2>::template make_params<tvec>(params);
+            RadialKernel<RADIAL_KERNEL_WENDLAND_C2>::template r2_derivative_coeffs<p,tvec>(
+                scaled_r2, kernel_params, coeffs, scale_exp
+            );
+            break;
+        }
         case RADIAL_KERNEL_SOFTENED_DISTANCE: {
             auto kernel_params = RadialKernel<RADIAL_KERNEL_SOFTENED_DISTANCE>::template make_params<tvec>(params);
             RadialKernel<RADIAL_KERNEL_SOFTENED_DISTANCE>::template r2_derivative_coeffs<p,tvec>(

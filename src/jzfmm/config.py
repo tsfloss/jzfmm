@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import jax
 import jax.numpy as jnp
 
@@ -75,6 +76,46 @@ class SoftenedDistanceKernel(KernelConfig):
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.softening], dtype=dtype)
 
+@dataclass(unsafe_hash=True, slots=True)
+class WendlandC2Kernel(KernelConfig):
+    r"""Compactly supported Wendland C2 kernel for kernel density estimates.
+
+    Implements :math:`K(r)=N_d\,(1-q)^4(1+4q)` for :math:`q=r/H<1` and
+    :math:`K(r)=0` otherwise, normalized to unit integral with
+    :math:`N_2=7/(\pi H^2)` and :math:`N_3=21/(2\pi H^3)`. The returned
+    potential is therefore the density :math:`\sum_j m_j K(|x-x_j|)` and the
+    returned force is its negative gradient. Evaluate densities at tracer
+    positions by adding them as zero-mass particles.
+
+    Use it together with :class:`OpeningBySupport` in the FMM, which evaluates
+    all interactions by leaf-leaf direct summation.
+
+    Args:
+        support: Support radius :math:`H` beyond which the kernel vanishes.
+        dim: Spatial dimension used for the normalization. Must be 2 or 3.
+    """
+
+    support : float = 0.1
+    dim : int = 3
+
+    def __post_init__(self):
+        if self.dim not in (2, 3):
+            raise ValueError(f"WendlandC2Kernel supports dim=2 or dim=3, got dim={self.dim}")
+        if not self.support > 0:
+            raise ValueError(f"WendlandC2Kernel requires support > 0, got {self.support}")
+
+    def norm(self) -> float:
+        """Returns the normalization constant :math:`N_d`."""
+        if self.dim == 2:
+            return 7. / (math.pi * self.support**2)
+        return 21. / (2. * math.pi * self.support**3)
+
+    def kind_id(self) -> int:
+        return 3
+
+    def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        return jnp.asarray([self.support, self.norm()], dtype=dtype)
+
 # ------------------------------------------------------------------------------------------------ #
 #                                              Opening                                             #
 # ------------------------------------------------------------------------------------------------ #
@@ -106,6 +147,29 @@ class OpeningByAngle(OpeningCriterionConfig):
 
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.theta], dtype=dtype)
+
+@dataclass(unsafe_hash=True, slots=True)
+class OpeningBySupport(OpeningCriterionConfig):
+    """Opening criterion for compactly supported kernels.
+
+    Opens every node pair whose boxes are closer than the support radius, so
+    that all non-vanishing interactions are evaluated by leaf-leaf direct
+    summation. Node pairs further apart are discarded without evaluating any
+    multipole interactions. The result is therefore exact rather than an
+    approximation, and a low multipole order such as ``p=1`` is sufficient.
+
+    Args:
+        support: Interaction radius. Must be at least the support of the
+            kernel, e.g. :paramref:`WendlandC2Kernel.support`.
+    """
+
+    support : float = 0.1
+
+    def kind_id(self) -> int:
+        return 1
+
+    def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        return jnp.asarray([self.support], dtype=dtype)
 
 @dataclass(unsafe_hash=True, slots=True)
 class PotentialField:

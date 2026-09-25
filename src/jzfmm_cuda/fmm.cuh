@@ -164,7 +164,8 @@ __global__ void CountInteractionsAndM2L(
                     childA[i], childB, opening_criterion
                 );
                 bool actually_open = need_open && (id >= 0);
-                bool interact_now = !need_open && (id >= 0);
+                bool interact_now = !need_open && (id >= 0)
+                    && OpeningCriterion<opening_criterion_kind>::evaluates_far_field;
                 any_interacts = any_interacts || interact_now;
 
                 // Sum over all threads

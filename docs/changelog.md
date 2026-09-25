@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added the compactly supported `WendlandC2Kernel` and the `OpeningBySupport` criterion for kernel density estimates. Node pairs within the support radius are opened down to leaf-leaf direct summation, while all other node pairs are discarded without M2L evaluations. Densities at tracer positions are obtained by adding zero-mass particles, and are differentiable with respect to particle positions and masses. This requires the updated CUDA backend.
+
 ## 1.0.1
 
 - Fixed invalid expansion scaling for tree cells spanning positive and negative coordinates and for tiny or coincident-particle cells. These cases could produce NaNs in FMM results and gradients, including MMD losses used in differentiable simulations. Updating is recommended, especially for differentiable workloads; the fix requires the updated CUDA backend as well as the Python package.

@@ -16,7 +16,7 @@ from jztree.comm import all_to_all_request_children, all_to_all_with_irank, get_
 from jztree.stats import AllocStats, stats_callback
 from jax.sharding import PartitionSpec as P
 
-from .config import DirectSummationConfig, FMMConfig
+from .config import DirectSummationConfig, FMMConfig, OpeningBySupport, WendlandC2Kernel
 from .data import LocalExpansion
 from .multipoles import _fmm_node_to_child, _shift_local_to_children_vjp_x, build_multipole_hierarchy, num_multi, p_of_num_multi
 
@@ -28,6 +28,22 @@ jax.ffi.register_ffi_target("LeafLeafPairSummation", ffi_pair_summation.LeafLeaf
 jax.ffi.register_ffi_target("BwdLeafLeafPairSummation", ffi_pair_summation.BwdLeafLeafPairSummation(), platform="CUDA")
 jax.ffi.register_ffi_target("DirectPairSummation", ffi_pair_summation.DirectPairSummation(), platform="CUDA")
 jax.ffi.register_ffi_target("BwdDirectPairSummation", ffi_pair_summation.BwdDirectPairSummation(), platform="CUDA")
+
+def _check_kernel_config(kernel, dim: int, opening=None):
+    """Rejects configurations that would silently produce wrong results."""
+    if isinstance(kernel, WendlandC2Kernel):
+        if kernel.dim != dim:
+            raise ValueError(
+                f"WendlandC2Kernel is normalized for dim={kernel.dim}, but the particles "
+                f"have dim={dim}."
+            )
+        if opening is not None and not (
+            isinstance(opening, OpeningBySupport) and opening.support >= kernel.support
+        ):
+            raise ValueError(
+                "WendlandC2Kernel requires opening=OpeningBySupport(support) with "
+                f"support >= {kernel.support}, got {opening}."
+            )
 
 # ------------------------------------------------------------------------------------------------ #
 #                                          M2L Evaluation                                          #
@@ -422,6 +438,7 @@ def direct_summation(
     posm = get_pos_mass(part)
     out_type = jax.ShapeDtypeStruct(posm.shape, posm.dtype)
     kernel = cfg_direct.kernel
+    _check_kernel_config(kernel, dim=part.pos.shape[-1])
     kernel_params = kernel.params(dtype=posm.dtype)
     
     @jax.custom_vjp
@@ -582,6 +599,7 @@ def fast_multipole_method(
     """
     assert pout == 1, "Only pout=1 (potential only) is supported currently."
     keys = _parse_fmm_result(result)
+    _check_kernel_config(cfg_fmm.kernel, dim=part.pos.shape[-1], opening=cfg_fmm.opening)
     in_smap = in_shard_map_context()
 
     if th is None:

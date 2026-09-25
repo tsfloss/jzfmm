@@ -60,7 +60,8 @@ other hash-based container.
 
 .. automodule:: jzfmm.config
    :members: KernelConfig, PlummerKernel, Plummer2DKernel,
-      SoftenedDistanceKernel, OpeningCriterionConfig, OpeningByAngle,
+      SoftenedDistanceKernel, WendlandC2Kernel, OpeningCriterionConfig,
+      OpeningByAngle, OpeningBySupport,
       PotentialField, UnitConfig, IntegratorConfig, DKDConfig, KDKConfig,
       DKDLatticeConfig, DirectSummationConfig, FMMConfig, SimConfig
    :member-order: bysource

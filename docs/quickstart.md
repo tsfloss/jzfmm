@@ -120,6 +120,34 @@ plt.show()
 
 ![FMM forces in the initial particle distribution](_static/quickstart/forces.png)
 
+## Kernel density estimates
+
+The same machinery evaluates densities with the compactly supported `WendlandC2Kernel`. Combined with `OpeningBySupport`, the tree walk only opens node pairs closer than the support radius and evaluates all of their interactions by direct summation, so the result is exact and a low multipole order suffices. The returned potential is the density, and its gradient is available from `loc.values[:, 1:]`. Densities at arbitrary positions are obtained by appending zero-mass tracer particles:
+
+```python
+support = 0.02
+cfg_density = jzfmm.FMMConfig(
+    kernel=jzfmm.WendlandC2Kernel(support=support, dim=3),
+    opening=jzfmm.OpeningBySupport(support=support),
+    p=1,
+    remove_self_interaction=False,
+)
+tracers = jnp.stack([jnp.linspace(-2.0, 2.0, 1024), jnp.zeros(1024), jnp.zeros(1024)], axis=-1)
+part = jzfmm.data.PosMass(
+    pos=jnp.concatenate([satellite.pos, tracers]),
+    mass=jnp.concatenate([satellite.mass, jnp.zeros(1024)]),
+)
+rho_tracers = jzfmm.fmm.fast_multipole_method.jit(part, cfg_fmm=cfg_density).potential()[-1024:]
+
+# The density estimate is differentiable, e.g. with respect to particle positions and masses
+def loss(part):
+    rho = jzfmm.fmm.fast_multipole_method(part, cfg_fmm=cfg_density).potential()[-1024:]
+    return jnp.sum(rho**2)
+grad = jax.jit(jax.grad(loss))(part)
+```
+
+If the support is large compared to the typical inter-particle distance, increase `alloc_fac_ilist` accordingly.
+
 ## Evolve a particle distribution
 
 A default `SimConfig` combines the FMM force solver with a drift-kick-drift integrator. The array `ts` contains the initial time and every integration endpoint, while `simulate` returns the final particle state.

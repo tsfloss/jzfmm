@@ -36,6 +36,8 @@ __global__ void CountInteractionsAndM2L(
     const int* ilist_isrc,
     const Node<dim,tvec>* children_recv,
     const Node<dim,tvec>* children_src,
+    const tvec* nquery_recv,
+    const tvec* nquery_src,
     const tvec* mp_src,
     const tvec* radial_kernel_params,
     const tvec* opening_criterion_params,
@@ -71,10 +73,12 @@ __global__ void CountInteractionsAndM2L(
         // childA info
         __shared__ Node<dim,tvec> childA[MAX_NUMA];
         __shared__ int scale_expA[MAX_NUMA];
+        __shared__ tvec nqueryA[MAX_NUMA];
         if(threadIdx.x < num_childrenA) {
             Node<dim,tvec> child = children_recv[offsetA + threadIdx.x];
             childA[threadIdx.x] = child;
             scale_expA[threadIdx.x] = expansion_exponent<dim,tvec>(child.level);
+            nqueryA[threadIdx.x] = nquery_recv[offsetA + threadIdx.x];
         }
 
         int num_open[MAX_NUMA];
@@ -145,8 +149,10 @@ __global__ void CountInteractionsAndM2L(
 
             // Each thread loads one other child B to check the opening criterion
             Node<dim,tvec> childB;
+            tvec nqueryB = tvec(0);
             if(id >= 0) {
                 childB = children_src[id];
+                nqueryB = nquery_src[id];
             }
 
             // For each child A, we count the cumulative number of opens and we 
@@ -160,11 +166,14 @@ __global__ void CountInteractionsAndM2L(
                 if(i >= num_childrenA)
                     continue;
 
-                bool need_open = (id >= 0) && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
+                // Pairs without any query particle cannot contribute to a query result and
+                // are discarded. This is symmetric, so the leaf interaction list stays symmetric.
+                bool relevant = (id >= 0) && ((nqueryA[i] > tvec(0)) || (nqueryB > tvec(0)));
+                bool need_open = relevant && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
                     childA[i], childB, opening_criterion
                 );
-                bool actually_open = need_open && (id >= 0);
-                bool interact_now = !need_open && (id >= 0)
+                bool actually_open = need_open;
+                bool interact_now = !need_open && relevant
                     && OpeningCriterion<opening_criterion_kind>::evaluates_far_field;
                 any_interacts = any_interacts || interact_now;
 
@@ -284,6 +293,8 @@ __global__ void InsertInteractions(
     const int* ilist_isrc,
     const Node<dim,tvec>* children_recv,
     const Node<dim,tvec>* children_src,
+    const tvec* nquery_recv,
+    const tvec* nquery_src,
     const int* spl_ilist_child,
     const tvec* opening_criterion_params,
     // outputs:
@@ -309,10 +320,12 @@ __global__ void InsertInteractions(
         // childA info
         __shared__ Node<dim,tvec> childA[MAX_NUMA];
         __shared__ int ilist_offsets[MAX_NUMA];
+        __shared__ tvec nqueryA[MAX_NUMA];
         if(threadIdx.x < num_childrenA) {
             Node<dim,tvec> child = children_recv[offsetA + threadIdx.x];
             childA[threadIdx.x] = child;
             ilist_offsets[threadIdx.x] = spl_ilist_child[offsetA + threadIdx.x];
+            nqueryA[threadIdx.x] = nquery_recv[offsetA + threadIdx.x];
         }
 
         int num_open[MAX_NUMA];
@@ -340,8 +353,10 @@ __global__ void InsertInteractions(
 
             // Each thread loads one other child B to check the opening criterion
             Node<dim,tvec> childB;
+            tvec nqueryB = tvec(0);
             if(id >= 0) {
                 childB = children_src[id];
+                nqueryB = nquery_src[id];
             }
 
             #pragma unroll
@@ -349,7 +364,10 @@ __global__ void InsertInteractions(
                 if(i >= num_childrenA)
                     continue;
 
-                bool need_open = (id >= 0) && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
+                // Pairs without any query particle cannot contribute to a query result and
+                // are discarded. This is symmetric, so the leaf interaction list stays symmetric.
+                bool relevant = (id >= 0) && ((nqueryA[i] > tvec(0)) || (nqueryB > tvec(0)));
+                bool need_open = relevant && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
                     childA[i], childB, opening_criterion
                 );
 

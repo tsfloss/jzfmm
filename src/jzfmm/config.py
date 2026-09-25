@@ -130,6 +130,9 @@ class OpeningCriterionConfig:
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         """Returns criterion parameters in the requested dtype."""
         raise NotImplementedError
+    def evaluates_far_field(self) -> bool:
+        """Whether node pairs that are not opened interact through multipoles."""
+        return True
 
 @dataclass(unsafe_hash=True, slots=True)
 class OpeningByAngle(OpeningCriterionConfig):
@@ -167,6 +170,9 @@ class OpeningBySupport(OpeningCriterionConfig):
 
     def kind_id(self) -> int:
         return 1
+
+    def evaluates_far_field(self) -> bool:
+        return False
 
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.support], dtype=dtype)

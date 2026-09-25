@@ -73,7 +73,7 @@ These functions evaluate interactions using either the fast multipole method
 or direct summation.
 
 .. automodule:: jzfmm.fmm
-   :members: direct_summation, fast_multipole_method
+   :members: direct_summation, fast_multipole_method, evaluate_at_positions
    :member-order: bysource
 
 Time integration

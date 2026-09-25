@@ -54,6 +54,8 @@ def _check_kernel_config(kernel, dim: int, opening=None):
 class _FMMChildData:
     poslvl: PosLvl
     mp: jax.Array
+    # Number of query particles per node. Pairs of nodes without queries are discarded.
+    nquery: jax.Array
 
 def _comm_buffer_size(base_size: int, factor: float) -> int:
     return max(base_size, int(np.ceil(base_size * factor)))
@@ -130,10 +132,11 @@ def _fmm_node_to_node(
     loc, interaction_counts = jax.ffi.ffi_call(
         "CountInteractionsAndM2L",
         (out_loc, out_interaction_count,),
-        input_output_aliases={11: 0},
+        input_output_aliases={13: 0},
     )(
         node_range, spl_recv, spl_src, ilist_ispl, ilist_isrc,
-        children_recv, children_src, child_src.mp, kernel_params, opening_params,
+        children_recv, children_src, child_recv.nquery, child_src.nquery,
+        child_src.mp, kernel_params, opening_params,
         single_thread_per_receiver, loc_in,
         p=np.int32(cfg_fmm.p),
         radial_kernel_kind=np.int32(kernel.kind_id()),
@@ -154,7 +157,8 @@ def _fmm_node_to_node(
         (out_child_ilist,)
     )(
         node_range, spl_recv, spl_src, ilist_ispl, ilist_isrc,
-        children_recv, children_src, ispl_child, opening_params,
+        children_recv, children_src, child_recv.nquery, child_src.nquery,
+        ispl_child, opening_params,
         opening_criterion_kind=np.int32(opening.kind_id()),
     )[0]
     child_ilist = pcast_like(child_ilist, spl_recv)
@@ -181,7 +185,10 @@ def _fmm_node_to_node(
     return loc, new_ilist
 _fmm_node_to_node.jit = jax.jit(_fmm_node_to_node, static_argnames=['cfg_fmm'])
 
-def _fmm_dual_walk(th: TreeHierarchy, mph: PackedArray, cfg_fmm: FMMConfig):
+def _fmm_dual_walk(
+        th: TreeHierarchy, mph: PackedArray, cfg_fmm: FMMConfig, qh: PackedArray | None = None
+    ):
+    """Dual tree walk. qh optionally holds the number of query particles per node."""
     in_smap = in_shard_map_context()
     if in_smap:
         rank, ndev, axis_name = get_rank_info()
@@ -228,9 +235,14 @@ def _fmm_dual_walk(th: TreeHierarchy, mph: PackedArray, cfg_fmm: FMMConfig):
         parent_cent = cent.get(level+1, size)
         single_thread_per_receiver = jnp.asarray(i == 0, dtype=jnp.int32)[None]
 
+        if qh is None:
+            nquery = jnp.ones(size, dtype=mph.data.dtype)
+        else:
+            nquery = qh.get(level, size=size, fill_value=0.)[:, 0]
         child_recv = _FMMChildData(
             poslvl=th.poslvl(level, size),
-            mp=mph.get(level, size=size)
+            mp=mph.get(level, size=size),
+            nquery=pcast_like(nquery, mph.data),
         )
 
         if in_smap:
@@ -407,6 +419,90 @@ def _leaf_leaf_summation(
     return eval(particles_recv, spl_recv, ilist, loc_in)
 _leaf_leaf_summation.jit = jax.jit(_leaf_leaf_summation, static_argnames=['cfg_fmm'])
 
+def _leaf_leaf_summation_queries(
+        particles: PosMass,
+        ispl: jax.Array,
+        ilist: InteractionList,
+        query_mask: jax.Array,
+        cfg_fmm: FMMConfig,
+        loc_in: jax.Array | None = None,
+    ) -> jax.Array:
+    """Leaf-leaf summation that only evaluates results at query particles.
+
+    The forward pass uses the query particles as receivers and all particles as
+    sources. Since only queries carry cotangents, the backward pass splits into
+    queries receiving from all particles and all particles receiving from queries.
+    Results at the remaining particles are NaN. Single device only.
+    """
+    n = particles.pos.shape[0]
+    dim = particles.pos.shape[-1]
+    block_size = 128
+    assert cfg_fmm.tree.max_leaf_size <= block_size
+
+    spl = jnp.asarray(ispl, dtype=jnp.int32)
+    ilist_ispl = jnp.asarray(ilist.ispl, dtype=jnp.int32)
+    ilist_isrc = jnp.asarray(ilist.isrc, dtype=jnp.int32)
+    node_range = jnp.array([0, spl.size-1], dtype=jnp.int32)
+
+    # Compact the query particles, which keeps them grouped by leaf
+    q = jnp.asarray(query_mask, dtype=bool)
+    qcum = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(q, dtype=jnp.int32)])
+    nq = qcum[-1]
+    spl_q = qcum[spl]
+    arange = jnp.arange(n, dtype=jnp.int32)
+    idx = jnp.zeros(n, jnp.int32).at[jnp.where(q, qcum[:-1], n)].set(arange, mode="drop")
+    valid_q = arange < nq
+    scatter_idx = jnp.where(valid_q, idx, n)
+
+    posm = get_pos_mass(particles)
+    out_type = jax.ShapeDtypeStruct((n, dim + 1), posm.dtype)
+    if loc_in is None:
+        loc_in = jnp.zeros(out_type.shape, dtype=out_type.dtype)
+    kernel = cfg_fmm.kernel
+    kernel_params = kernel.params(dtype=posm.dtype)
+    attrs = dict(
+        radial_kernel_kind=np.int32(kernel.kind_id()), block_size=np.uint64(block_size),
+        kahan=bool(cfg_fmm.kahan_summation),
+        remove_self_interaction=bool(cfg_fmm.remove_self_interaction),
+    )
+
+    def to_full(x_q, fill):
+        return jnp.full(out_type.shape, fill, dtype=x_q.dtype).at[scatter_idx].set(x_q, mode="drop")
+
+    @jax.custom_vjp
+    def eval(posm, loc_in):
+        posm_q = posm[idx]
+        loc_q = jax.ffi.ffi_call("LeafLeafPairSummation", (out_type,), input_output_aliases={8: 0})(
+            node_range, spl_q, spl, ilist_ispl, ilist_isrc, posm_q, posm, kernel_params,
+            loc_in[idx], **attrs
+        )[0]
+        return to_full(loc_q, jnp.nan)
+
+    def eval_fwd(posm, loc_in):
+        return eval(posm, loc_in), posm
+
+    def eval_bwd(posm, gloc):
+        gloc = jnp.where(q[:, None], gloc, 0.)
+        posm_q = posm[idx]
+        gloc_q = jnp.where(valid_q[:, None], gloc[idx], 0.)
+        # Queries receive from all particles
+        gposm_q = jax.ffi.ffi_call("BwdLeafLeafPairSummation", (out_type,))(
+            node_range, spl_q, spl, ilist_ispl, ilist_isrc, posm_q, posm, kernel_params,
+            gloc_q, gloc, **attrs
+        )[0]
+        # All particles receive from queries. Only kept for non-queries, since the
+        # contributions to queries are already complete above.
+        gposm_all = jax.ffi.ffi_call("BwdLeafLeafPairSummation", (out_type,))(
+            node_range, spl, spl_q, ilist_ispl, ilist_isrc, posm, posm_q, kernel_params,
+            gloc, gloc_q, **attrs
+        )[0]
+        gposm = jnp.where(q[:, None], to_full(gposm_q, 0.), gposm_all)
+        return gposm, gloc
+
+    eval.defvjp(eval_fwd, eval_bwd)
+
+    return eval(posm, loc_in)
+
 
 # ------------------------------------------------------------------------------------------------ #
 #                                      Direct Summation Forces                                     #
@@ -505,11 +601,21 @@ _direct_potential_scan_jax.jit = jax.jit(_direct_potential_scan_jax, static_argn
 # ------------------------------------------------------------------------------------------------ #
 
 
-def _evaluate_node_node_fmm(partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig) -> Tuple[jax.Array, InteractionList]:
+def _query_hierarchy(th: TreeHierarchy, pos: jax.Array, query_mask: jax.Array, cfg_fmm: FMMConfig
+                     ) -> PackedArray:
+    """Number of query particles per node, as the monopoles of the query indicator."""
+    weights = jnp.asarray(query_mask, dtype=pos.dtype)
+    return build_multipole_hierarchy(
+        th, jax.lax.stop_gradient(pos), jax.lax.stop_gradient(weights), cfg_fmm=cfg_fmm
+    )
+
+def _evaluate_node_node_fmm(
+        partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig, qh: PackedArray | None = None
+    ) -> Tuple[jax.Array, InteractionList]:
     
     def eval_fwd(pos, mp, pout=1):
         mph = build_multipole_hierarchy(th, pos, mp, cfg_fmm=cfg_fmm)
-        loc_node, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm)
+        loc_node, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh)
         ispl = th.splits_leaf_to_part()
         node = th.poslvl(0)
         # Particle scale H=1 makes the L2P output use physical derivative units.
@@ -544,16 +650,47 @@ def _evaluate_node_node_fmm(partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMCo
 _evaluate_node_node_fmm.jit = jax.jit(_evaluate_node_node_fmm, static_argnames=['cfg_fmm', ])
 
 def _fast_multipole_method_z(
-        partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig, G=1., pout: int = 1
+        partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig, G=1., pout: int = 1,
+        query_mask: jax.Array | None = None
     ) -> LocalExpansion:
     assert pout == 1, "Only pout=1 (potential only) is supported currently."
+    dim = partz.pos.shape[-1]
 
-    loc_node_node, ilist = _evaluate_node_node_fmm(partz, th, cfg_fmm=cfg_fmm)
+    qh = None if query_mask is None else _query_hierarchy(th, partz.pos, query_mask, cfg_fmm)
+
+    if cfg_fmm.opening.evaluates_far_field():
+        loc_node_node, ilist = _evaluate_node_node_fmm(partz, th, cfg_fmm=cfg_fmm, qh=qh)
+    else:
+        # Without far-field interactions the node-node part only determines the leaf
+        # interaction list. It contributes nothing to the result or to its gradients.
+        # Multipoles are only read for M2L, so any hierarchy of the right shape will do.
+        if qh is not None:
+            mph = qh
+        else:
+            mp = jnp.broadcast_to(jnp.reshape(partz.mass, jnp.shape(partz.mass) + (1,)),
+                                  partz.pos.shape[:1] + (1,))
+            mph = build_multipole_hierarchy(
+                th, jax.lax.stop_gradient(partz.pos), jax.lax.stop_gradient(mp), cfg_fmm=cfg_fmm
+            )
+        _, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh)
+        loc_node_node = jnp.zeros((partz.pos.shape[0], num_multi(pout, dim=dim)), dtype=mph.data.dtype)
+        loc_node_node = pcast_like(loc_node_node, partz.pos)
     spl = th.splits_leaf_to_part()
 
-    loc = _leaf_leaf_summation(partz, spl, jax.lax.stop_gradient(ilist), cfg_fmm=cfg_fmm, loc_in=loc_node_node)
+    ilist = jax.lax.stop_gradient(ilist)
+    if query_mask is None:
+        loc = _leaf_leaf_summation(partz, spl, ilist, cfg_fmm=cfg_fmm, loc_in=loc_node_node)
+    elif in_shard_map_context():
+        # Query-restricted receivers are not implemented for distributed interaction lists,
+        # but node pairs without queries are still skipped.
+        loc = _leaf_leaf_summation(partz, spl, ilist, cfg_fmm=cfg_fmm, loc_in=loc_node_node)
+        loc = jnp.where(jnp.asarray(query_mask, dtype=bool)[:, None], loc, jnp.nan)
+    else:
+        loc = _leaf_leaf_summation_queries(
+            partz, spl, ilist, query_mask, cfg_fmm=cfg_fmm, loc_in=loc_node_node
+        )
 
-    return LocalExpansion(loc * G, dim=partz.pos.shape[-1])
+    return LocalExpansion(loc * G, dim=dim)
 _fast_multipole_method_z.jit = jax.jit(_fast_multipole_method_z, static_argnames=("cfg_fmm", "G", "pout"))
 
 def _parse_fmm_result(result: str) -> Tuple[str, ...]:
@@ -573,7 +710,8 @@ def _as_posmass(part) -> PosMass:
 
 def fast_multipole_method(
         part: PosMass, cfg_fmm: FMMConfig, th: TreeHierarchy | None = None,
-        result: str = "loc", G: float = 1., pout: int = 1
+        result: str = "loc", G: float = 1., pout: int = 1,
+        query_mask: jax.Array | None = None
     ) -> LocalExpansion:
     """Evaluates particle interactions with the fast multipole method.
 
@@ -594,6 +732,13 @@ def fast_multipole_method(
         G: Gravitational constant or multiplicative interaction strength.
         pout: Output expansion order. Currently only ``1`` is supported,
             returning the potential and force.
+        query_mask: Optional boolean array of shape ``(size,)`` marking the
+            particles at which results are required, in the same order as
+            :paramref:`part`. Node pairs that contain no query particle are
+            skipped, which can save most of the work when queries are sparse.
+            Results at the remaining particles are ``NaN``. Gradients with
+            respect to all particles remain exact. See also
+            :func:`evaluate_at_positions`.
     Returns:
         The requested result, or a tuple when multiple results are requested.
     """
@@ -612,10 +757,18 @@ def fast_multipole_method(
             ndev = 1
             origin = RankIdx(rank=None, idx=idx)
         num_origin = get_num(part, default_to_length=(ndev == 1))
-        partz, dataz, th = zsort_and_tree(
-            part, cfg_fmm.tree, data=origin
-        )
-        origin_z = dataz
+        if query_mask is None:
+            partz, origin_z, th = zsort_and_tree(part, cfg_fmm.tree, data=origin)
+            query_mask_z = None
+        else:
+            query_mask = jnp.asarray(query_mask, dtype=bool)
+            if query_mask.shape != part.pos.shape[:1]:
+                raise ValueError(
+                    f"query_mask must have shape {part.pos.shape[:1]}, got {query_mask.shape}"
+                )
+            partz, (origin_z, query_mask_z), th = zsort_and_tree(
+                part, cfg_fmm.tree, data=(origin, query_mask.astype(jnp.int32))
+            )
     elif "loc" in keys:
         raise ValueError(
             "result='loc' is only available when fast_multipole_method builds the tree. "
@@ -625,10 +778,13 @@ def fast_multipole_method(
         partz = part
         origin_z = None
         num_origin = None
+        query_mask_z = query_mask
 
     locz = None
     if ("loc" in keys) or ("locz" in keys):
-        locz = _fast_multipole_method_z(_as_posmass(partz), th, cfg_fmm=cfg_fmm, G=G, pout=pout)
+        locz = _fast_multipole_method_z(
+            _as_posmass(partz), th, cfg_fmm=cfg_fmm, G=G, pout=pout, query_mask=query_mask_z
+        )
 
     loc = None
     if "loc" in keys:
@@ -653,6 +809,48 @@ def fast_multipole_method(
 fast_multipole_method.jit = jax.jit(fast_multipole_method, static_argnames=("cfg_fmm", "result", "G", "pout"))
 fast_multipole_method.smap = shard_map_constructor(
     fast_multipole_method,
-    in_specs=(P(-1), None, P(-1), None, None, None),
+    in_specs=(P(-1), None, P(-1), None, None, None, P(-1)),
     static_argnames=("cfg_fmm", "result", "G", "pout"),
 )
+
+def evaluate_at_positions(
+        part: PosMass, pos_query: jax.Array, cfg_fmm: FMMConfig, G: float = 1.
+    ) -> LocalExpansion:
+    """Evaluates the field of the particles at arbitrary query positions.
+
+    **Compatibility:** :compat-jit:`JIT` :compat-shard-local:`Local only`
+    :compat-autodiff:`Autodiff`
+
+    **Helpers:** :helper-jit:`.jit`
+
+    The queries are added as zero-mass particles and only interactions that
+    affect them are evaluated (see :paramref:`fast_multipole_method.query_mask`).
+    For example, with :class:`jzfmm.config.WendlandC2Kernel` and
+    :class:`jzfmm.config.OpeningBySupport`, the potential of the result is the
+    kernel density estimate at the query positions. Results are differentiable
+    with respect to the particle positions and masses and the query positions.
+
+    Args:
+        part: Source particles with positions of shape ``(N, dim)`` and scalar
+            or ``(N,)`` masses. Padded particle data is not supported.
+        pos_query: Query positions of shape ``(M, dim)``.
+        cfg_fmm: Fast-multipole configuration.
+        G: Multiplicative interaction strength.
+    Returns:
+        Local expansion at the ``M`` query positions.
+    """
+    if in_shard_map_context():
+        raise NotImplementedError("evaluate_at_positions does not support shard_map yet.")
+    if getattr(part, "num", None) is not None:
+        raise ValueError("evaluate_at_positions does not support padded particle data.")
+    nsrc, nquery = part.pos.shape[0], pos_query.shape[0]
+    pos_query = jnp.asarray(pos_query, dtype=part.pos.dtype)
+    mass = jnp.broadcast_to(jnp.asarray(part.mass, dtype=part.pos.dtype), (nsrc,))
+    combined = PosMass(
+        pos=jnp.concatenate([part.pos, pos_query]),
+        mass=jnp.concatenate([mass, jnp.zeros(nquery, dtype=mass.dtype)]),
+    )
+    query_mask = jnp.arange(nsrc + nquery) >= nsrc
+    loc = fast_multipole_method(combined, cfg_fmm=cfg_fmm, G=G, query_mask=query_mask)
+    return LocalExpansion(loc.values[nsrc:], dim=part.pos.shape[-1])
+evaluate_at_positions.jit = jax.jit(evaluate_at_positions, static_argnames=("cfg_fmm", "G"))

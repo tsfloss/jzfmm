@@ -210,6 +210,9 @@ __global__ void LeafLeafPairSummation(
     int2 prange = {spl_recv[nodeid], spl_recv[nodeid + 1]};
 
     int num = prange.y-prange.x;
+    // Leaves can be empty when receivers are restricted to query particles
+    if (num <= 0)
+        return;
 
     // Precalculate layout for M2L interactions: blockdim.x -> (num, n_write) + residuals
     int n_write = blockDim.x / num;
@@ -304,6 +307,9 @@ __global__ void BwdLeafLeafPairSummation(
     int2 prange = {spl_recv[nodeid], spl_recv[nodeid + 1]};
 
     int num = prange.y-prange.x;
+    // Leaves can be empty when receivers are restricted to query particles
+    if (num <= 0)
+        return;
 
     // See comment in LeafLeafPairSummation for explanation
     int n_write = blockDim.x / num;

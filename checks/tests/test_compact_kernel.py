@@ -12,10 +12,10 @@ from jax.test_util import check_grads
 
 from jztree.tree import _dense_interaction_list
 
-from jzfmm.config import DirectSummationConfig, FMMConfig, OpeningByAngle, OpeningBySupport
+from jzfmm.config import DirectSummationConfig, FMMConfig, OpeningByAngle, OpeningBySupport, PlummerKernel
 from jzfmm.config import WendlandC2Kernel
 from jzfmm.data import PosMass
-from jzfmm.fmm import _leaf_leaf_summation, direct_summation, fast_multipole_method
+from jzfmm.fmm import _leaf_leaf_summation, direct_summation, evaluate_at_positions, fast_multipole_method
 
 # ------------------------------------------------------------------------------------------------ #
 #                                             Helpers                                              #
@@ -294,3 +294,121 @@ def test_config_validation():
         )
     with pytest.raises(ValueError):
         WendlandC2Kernel(support=support, dim=4)
+
+# ------------------------------------------------------------------------------------------------ #
+#                                   Query-restricted evaluation                                    #
+# ------------------------------------------------------------------------------------------------ #
+
+def _clustered_positions(key, n, dim):
+    """Clumps of very different sizes plus a uniform background."""
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    nc = 32
+    cen = jax.random.uniform(k1, (nc, dim))
+    rs = 10**jax.random.uniform(k2, (nc,), minval=-2.2, maxval=-1.)
+    ic = jax.random.randint(k3, (n,), 0, nc)
+    x = cen[ic] + rs[ic, None] * jax.random.normal(k4, (n, dim))
+    return jnp.where(jnp.arange(n)[:, None] < 0.7 * n, x, jax.random.uniform(k1, (n, dim)))
+
+@pytest.mark.shrink_in_quick(keep_index=1)
+@pytest.mark.parametrize("ic", ("uniform", "clustered"))
+@pytest.mark.parametrize("dim", (2, 3))
+def test_evaluate_at_positions(dim, ic):
+    nbody, ntracer = 2**14, 500
+    support = _support_for_neighbours(nbody, dim)
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(4), 3)
+    if ic == "uniform":
+        pos = jax.random.uniform(k1, (nbody, dim))
+        tr = jax.random.uniform(k2, (ntracer, dim))
+    else:
+        pos = _clustered_positions(k1, nbody, dim)
+        tr = pos[:ntracer] + 0.3 * support * jax.random.normal(k2, (ntracer, dim))
+    mass = jax.random.uniform(k3, (nbody,), minval=0.5, maxval=1.5) / nbody
+    cfg_fmm, _ = _configs(support, dim)
+    cfg_fmm.alloc_fac_ilist = 256.
+
+    loc = evaluate_at_positions.jit(PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm)
+    rho = lambda x: _density_ref(x, pos, mass, support, dim)
+    rho_ref = rho(tr)
+    grad_ref = jax.vmap(jax.grad(lambda xi: rho(xi[None])[0]))(tr)
+
+    assert loc.values.shape == (ntracer, dim + 1)
+    np.testing.assert_allclose(loc.potential(), rho_ref, rtol=1e-4, atol=1e-5 * float(jnp.max(rho_ref)))
+    np.testing.assert_allclose(
+        loc.values[:, 1:], grad_ref, rtol=1e-3, atol=1e-5 * float(jnp.max(jnp.abs(grad_ref)))
+    )
+
+@pytest.mark.parametrize("with_force", (False, True))
+@pytest.mark.parametrize("dim", (2, 3))
+def test_evaluate_at_positions_gradients(dim, with_force):
+    nbody, ntracer = 4096, 300
+    support = _support_for_neighbours(nbody, dim)
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(9), 4)
+    pos = _clustered_positions(k1, nbody, dim)
+    tr = pos[:ntracer] + 0.3 * support * jax.random.normal(k2, (ntracer, dim))
+    mass = jax.random.uniform(k3, (nbody,), minval=0.5, maxval=1.5) / nbody
+    w = jax.random.normal(k4, (ntracer,))
+    v = jax.random.normal(k4, (ntracer, dim)) * support
+    cfg_fmm, cfg_direct = _configs(support, dim)
+    cfg_fmm.alloc_fac_ilist = 256.
+
+    def loss_from_values(values):
+        loss = jnp.sum(w * values[:, 0])
+        if with_force:
+            loss = loss + jnp.sum(v * values[:, 1:])
+        return loss
+
+    def loss_fmm(pos, mass, tr):
+        return loss_from_values(evaluate_at_positions(PosMass(pos=pos, mass=mass), tr, cfg_fmm).values)
+
+    def loss_direct(pos, mass, tr):
+        part = PosMass(pos=jnp.concatenate([pos, tr]),
+                       mass=jnp.concatenate([mass, jnp.zeros(ntracer)]))
+        return loss_from_values(direct_summation(part, cfg_direct=cfg_direct).values[nbody:])
+
+    g = jax.jit(jax.grad(loss_fmm, argnums=(0, 1, 2)))(pos, mass, tr)
+    g_ref = jax.jit(jax.grad(loss_direct, argnums=(0, 1, 2)))(pos, mass, tr)
+    for name, a, b in zip(("pos", "mass", "tracer pos"), g, g_ref):
+        assert np.isfinite(a).all(), name
+        np.testing.assert_allclose(
+            a, b, rtol=2e-3, atol=2e-4 * float(jnp.max(jnp.abs(b))), err_msg=name
+        )
+
+def test_query_mask_marks_other_particles_nan():
+    dim, nbody, ntracer = 3, 4096, 256
+    support = _support_for_neighbours(nbody, dim)
+    part = _particles(nbody, ntracer, dim)
+    cfg_fmm, _ = _configs(support, dim)
+    mask = jnp.arange(nbody + ntracer) >= nbody
+
+    full = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm).values
+    restricted = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm, query_mask=mask).values
+
+    assert jnp.all(jnp.isnan(restricted[:nbody]))
+    np.testing.assert_allclose(restricted[nbody:], full[nbody:], rtol=1e-5,
+                               atol=1e-6 * float(jnp.max(jnp.abs(full[nbody:]))))
+    with pytest.raises(ValueError, match="query_mask"):
+        fast_multipole_method(part, cfg_fmm=cfg_fmm, query_mask=mask[:-1])
+
+def test_query_mask_far_field_kernel():
+    """Query restriction also prunes far-field (M2L) interactions consistently."""
+    dim, n = 3, 8192
+    part = PosMass(pos=_clustered_positions(jax.random.PRNGKey(2), n, dim),
+                   mass=jnp.full(n, 1. / n))
+    mask = jax.random.uniform(jax.random.PRNGKey(3), (n,)) < 0.02
+    cfg_fmm = FMMConfig(kernel=PlummerKernel(softening=0.01), p=4, opening=OpeningByAngle(theta=0.5),
+                        alloc_fac_ilist=256.)
+
+    def loss(part, query_mask):
+        values = fast_multipole_method(part, cfg_fmm=cfg_fmm, query_mask=query_mask).values
+        return jnp.sum(jnp.where(mask[:, None], values, 0.))
+
+    full = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm).values
+    restricted = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm, query_mask=mask).values
+    np.testing.assert_allclose(restricted[mask], full[mask], rtol=1e-5,
+                               atol=1e-6 * float(jnp.max(jnp.abs(full[mask]))))
+
+    g_full = jax.jit(jax.grad(lambda p: loss(p, None)))(part)
+    g_restricted = jax.jit(jax.grad(lambda p: loss(p, mask)))(part)
+    for a, b in ((g_restricted.pos, g_full.pos), (g_restricted.mass, g_full.mass)):
+        assert np.isfinite(a).all()
+        np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5 * float(jnp.max(jnp.abs(b))))

@@ -3,6 +3,7 @@
 
 #include "common/data.cuh"
 #include "common/math.cuh"
+#include "radial_kernels.cuh"
 
 static constexpr int OPENING_BY_ANGLE = 0;
 static constexpr int OPENING_BY_SUPPORT = 1;
@@ -66,11 +67,12 @@ struct OpeningCriterion<OPENING_BY_SUPPORT> {
     template<typename tvec>
     struct Params {
         tvec support;
+        tvec boxsize; // periodic box size, <= 0 if not periodic
     };
 
     template<typename tvec>
     __device__ __forceinline__ static Params<tvec> make_params(const tvec* params) {
-        return Params<tvec>{params[0]};
+        return Params<tvec>{params[0], params[1]};
     }
 
     template<int dim, typename tvec>
@@ -82,9 +84,11 @@ struct OpeningCriterion<OPENING_BY_SUPPORT> {
         // Open if the minimum distance between the two node boxes is within the support.
         // This is symmetric in A and B, so leaf-leaf interaction lists remain symmetric.
         // We use the same scaling strategy as OPENING_BY_ANGLE to avoid overflows.
+        // With periodic boundaries the center offset to the nearest image of B also
+        // gives the smallest gap, since the gap grows with |dx| on every axis.
         const Vec<dim,int32_t> levelsA = lvl_vec<dim>(nodeA.level);
         const Vec<dim,int32_t> levelsB = lvl_vec<dim>(nodeB.level);
-        const Vec<dim,tvec> dx = nodeA.center - nodeB.center;
+        const Vec<dim,tvec> dx = periodic_wrap<dim,tvec>(nodeA.center - nodeB.center, params.boxsize);
 
         int scale_exp = max(levelsA[dim - 1], levelsB[dim - 1]);
         const tvec dx_max = absmax(dx);

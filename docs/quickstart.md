@@ -141,6 +141,8 @@ def loss(satellite):
 grad = jax.jit(jax.grad(loss))(satellite)
 ```
 
+For a periodic box of side length `L`, pass `boxsize=L` to both `WendlandC2Kernel` and `OpeningBySupport`. Distances then use the nearest periodic image, which requires `support < L/2`.
+
 To evaluate at a subset of the particles themselves, pass a boolean `query_mask` to `fast_multipole_method` instead. If the support is large compared to the typical inter-particle distance, increase `alloc_fac_ilist` accordingly.
 
 ## Evolve a particle distribution

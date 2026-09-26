@@ -412,3 +412,129 @@ def test_query_mask_far_field_kernel():
     for a, b in ((g_restricted.pos, g_full.pos), (g_restricted.mass, g_full.mass)):
         assert np.isfinite(a).all()
         np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5 * float(jnp.max(jnp.abs(b))))
+
+# ------------------------------------------------------------------------------------------------ #
+#                                       Periodic boundaries                                        #
+# ------------------------------------------------------------------------------------------------ #
+
+def _density_ref_periodic(x, pos, mass, support, dim, boxsize):
+    dx = x[:, None, :] - pos[None, :, :]
+    dx = dx - boxsize * jnp.round(dx / boxsize)
+    return jnp.sum(mass[None, :] * _wendland_ref(jnp.sum(dx**2, axis=-1), support, dim), axis=-1)
+
+def _periodic_configs(support, dim, boxsize):
+    kernel = WendlandC2Kernel(support=support, dim=dim, boxsize=boxsize)
+    cfg_fmm = FMMConfig(
+        kernel=kernel, p=1, opening=OpeningBySupport(support=support, boxsize=boxsize),
+        remove_self_interaction=False, alloc_fac_ilist=256.,
+    )
+    cfg_direct = DirectSummationConfig(kernel=kernel, remove_self_interaction=False)
+    return cfg_fmm, cfg_direct
+
+def _periodic_particles(nbody, ntracer, dim, boxsize, seed=0):
+    """Clustered particles in a periodic box, with clumps and tracers spanning its faces."""
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(seed), 3)
+    pos = _clustered_positions(k1, nbody, dim) * boxsize
+    # Clumps centred on a corner and on a face, cut by the box boundary
+    ncl = nbody // 8
+    pos = pos.at[:ncl].set(0.03 * boxsize * jax.random.normal(k2, (ncl, dim)))
+    pos = pos.at[ncl:2*ncl, 0].set(0.02 * boxsize * jax.random.normal(k3, (ncl,)))
+    pos = pos % boxsize
+    tr = jnp.concatenate([pos[:ntracer // 2], jax.random.uniform(k2, (ntracer // 2, dim)) * boxsize])
+    tr = (tr + 0.01 * boxsize * jax.random.normal(k3, tr.shape)) % boxsize
+    mass = jax.random.uniform(k3, (nbody,), minval=0.5, maxval=1.5) / nbody
+    return pos, mass, tr
+
+@pytest.mark.parametrize("dim", (2, 3))
+def test_periodic_vs_reference(dim):
+    boxsize, nbody, ntracer = 3., 2**13, 512
+    support = 0.08 * boxsize
+    pos, mass, tr = _periodic_particles(nbody, ntracer, dim, boxsize)
+    cfg_fmm, cfg_direct = _periodic_configs(support, dim, boxsize)
+
+    rho = lambda x: _density_ref_periodic(x, pos, mass, support, dim, boxsize)
+    rho_ref = rho(tr)
+    grad_ref = jax.vmap(jax.grad(lambda xi: rho(xi[None])[0]))(tr)
+    # Non-periodic densities differ at the faces, so this test is sensitive to the wrap
+    rho_open = _density_ref(tr, pos, mass, support, dim)
+    assert float(jnp.max(jnp.abs(rho_open - rho_ref))) > 0.1 * float(jnp.max(rho_ref))
+
+    part = PosMass(pos=jnp.concatenate([pos, tr]), mass=jnp.concatenate([mass, jnp.zeros(ntracer)]))
+    loc_direct = direct_summation.jit(part, cfg_direct=cfg_direct).values[nbody:]
+    loc_fmm = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm).values[nbody:]
+    loc_eval = evaluate_at_positions.jit(PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm).values
+
+    for name, loc in (("direct", loc_direct), ("fmm", loc_fmm), ("evaluate_at_positions", loc_eval)):
+        np.testing.assert_allclose(
+            loc[:, 0], rho_ref, rtol=1e-4, atol=1e-5 * float(jnp.max(rho_ref)), err_msg=name
+        )
+        np.testing.assert_allclose(
+            loc[:, 1:], grad_ref, rtol=1e-3, atol=1e-5 * float(jnp.max(jnp.abs(grad_ref))), err_msg=name
+        )
+
+@pytest.mark.parametrize("dim", (2, 3))
+def test_periodic_translation_invariance(dim):
+    """Shifting everything by a constant, with or without wrapping into the box, changes nothing."""
+    boxsize, nbody, ntracer = 1., 2**14, 1024
+    support = _support_for_neighbours(nbody, dim) * boxsize
+    pos, mass, tr = _periodic_particles(nbody, ntracer, dim, boxsize, seed=3)
+    cfg_fmm, _ = _periodic_configs(support, dim, boxsize)
+    evaluate = lambda p, t: evaluate_at_positions.jit(PosMass(pos=p, mass=mass), t, cfg_fmm=cfg_fmm).values
+
+    ref = evaluate(pos, tr)
+    shift = jnp.asarray([0.37, 0.81, 0.55][:dim]) * boxsize
+    wrapped = evaluate((pos + shift) % boxsize, (tr + shift) % boxsize)
+    # Positions outside [0, boxsize), e.g. unwrapped N-body output
+    unwrapped = evaluate(pos + shift, tr + shift - boxsize)
+
+    for name, loc in (("wrapped", wrapped), ("unwrapped", unwrapped)):
+        np.testing.assert_allclose(
+            loc, ref, rtol=1e-4, atol=1e-5 * float(jnp.max(jnp.abs(ref))), err_msg=name
+        )
+
+@pytest.mark.parametrize("dim", (2, 3))
+def test_periodic_gradients(dim):
+    boxsize, nbody, ntracer = 2., 4096, 400
+    support = 0.08 * boxsize
+    pos, mass, tr = _periodic_particles(nbody, ntracer, dim, boxsize, seed=5)
+    k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+    w = jax.random.normal(k1, (ntracer,))
+    v = jax.random.normal(k2, (ntracer, dim)) * support
+    cfg_fmm, _ = _periodic_configs(support, dim, boxsize)
+
+    def loss_fmm(pos, mass, tr):
+        loc = evaluate_at_positions(PosMass(pos=pos, mass=mass), tr, cfg_fmm)
+        return jnp.sum(w * loc.values[:, 0]) + jnp.sum(v * loc.values[:, 1:])
+
+    def loss_ref(pos, mass, tr):
+        rho = lambda x: _density_ref_periodic(x, pos, mass, support, dim, boxsize)
+        grad = jax.vmap(jax.grad(lambda xi: rho(xi[None])[0]))(tr)
+        return jnp.sum(w * rho(tr)) + jnp.sum(v * grad)
+
+    g = jax.jit(jax.grad(loss_fmm, argnums=(0, 1, 2)))(pos, mass, tr)
+    g_ref = jax.jit(jax.grad(loss_ref, argnums=(0, 1, 2)))(pos, mass, tr)
+    for name, a, b in zip(("pos", "mass", "tracer pos"), g, g_ref):
+        assert np.isfinite(a).all(), name
+        np.testing.assert_allclose(
+            a, b, rtol=2e-3, atol=2e-4 * float(jnp.max(jnp.abs(b))), err_msg=name
+        )
+
+def test_periodic_config_validation():
+    dim, support, boxsize = 3, 0.1, 1.
+    part = _particles(256, 0, dim)
+    kernel = WendlandC2Kernel(support=support, dim=dim, boxsize=boxsize)
+
+    with pytest.raises(ValueError, match="boxsize"):
+        fast_multipole_method(part, cfg_fmm=FMMConfig(
+            kernel=kernel, opening=OpeningBySupport(support=support)))
+    with pytest.raises(ValueError, match="boxsize"):
+        fast_multipole_method(part, cfg_fmm=FMMConfig(
+            kernel=WendlandC2Kernel(support=support, dim=dim),
+            opening=OpeningBySupport(support=support, boxsize=boxsize)))
+    with pytest.raises(ValueError, match="only supported for WendlandC2Kernel"):
+        fast_multipole_method(part, cfg_fmm=FMMConfig(
+            kernel=PlummerKernel(), opening=OpeningBySupport(support=support, boxsize=boxsize)))
+    with pytest.raises(ValueError, match="2\\*support"):
+        WendlandC2Kernel(support=0.6, dim=dim, boxsize=boxsize)
+    with pytest.raises(ValueError, match="2\\*support"):
+        OpeningBySupport(support=0.6, boxsize=boxsize)

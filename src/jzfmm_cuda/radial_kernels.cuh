@@ -8,6 +8,21 @@ static constexpr int RADIAL_KERNEL_PLUMMER_2D = 1;
 static constexpr int RADIAL_KERNEL_SOFTENED_DISTANCE = 2;
 static constexpr int RADIAL_KERNEL_WENDLAND_C2 = 3;
 
+// Minimum-image convention: wraps each component of a displacement into
+// [-boxsize/2, boxsize/2]. boxsize <= 0 disables wrapping.
+template<int dim, typename tvec>
+__device__ __forceinline__ Vec<dim,tvec> periodic_wrap(Vec<dim,tvec> dx, tvec boxsize) {
+    if(boxsize > tvec(0)) {
+        // Multiplying by the inverse avoids a division per pair. It can round differently
+        // only at |dx| = boxsize/2, where both images are equally far and beyond the support.
+        const tvec inv_boxsize = tvec(1) / boxsize;
+        #pragma unroll
+        for(int i = 0; i < dim; i++)
+            dx[i] -= boxsize * rint(dx[i] * inv_boxsize);
+    }
+    return dx;
+}
+
 // scale_exp is zero for direct interactions, or bounded_expansion_exponent
 // for M2L: both 2^scale_exp and its reciprocal are normal floating-point values.
 template<int radial_kernel_kind>
@@ -132,11 +147,12 @@ struct RadialKernel<RADIAL_KERNEL_WENDLAND_C2> {
     struct Params {
         tvec support;
         tvec norm;
+        tvec boxsize; // periodic box size, <= 0 if not periodic
     };
 
     template<typename tvec>
     __device__ __forceinline__ static Params<tvec> make_params(const tvec* params) {
-        return Params<tvec>{params[0], params[1]};
+        return Params<tvec>{params[0], params[1], params[2]};
     }
 
     template<int p, typename tvec>
@@ -190,6 +206,18 @@ struct RadialKernel<RADIAL_KERNEL_WENDLAND_C2> {
         }
     }
 };
+
+// Periodic box size used for pair displacements, or 0 for open boundaries.
+// Only compactly supported kernels can be periodic, since they have no far field.
+template<int radial_kernel_kind, typename tvec>
+__device__ __forceinline__ tvec radial_kernel_boxsize(
+    const typename RadialKernel<radial_kernel_kind>::template Params<tvec>& params
+) {
+    if constexpr (radial_kernel_kind == RADIAL_KERNEL_WENDLAND_C2)
+        return params.boxsize;
+    else
+        return tvec(0);
+}
 
 template<int p, typename tvec>
 __device__ __forceinline__ void evaluate_radial_kernel_derivatives(

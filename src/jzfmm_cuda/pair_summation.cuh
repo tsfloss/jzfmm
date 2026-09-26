@@ -32,7 +32,9 @@ __forceinline__ __device__ LocalExp<dim,tvec> EvaluatePairInteraction(
     PosMass<dim,tvec> xmj,
     typename RadialKernel<radial_kernel_kind>::template Params<tvec> radial_kernel
 ) {
-    Vec<dim,tvec> dx = xmj.pos - xmi.pos;
+    Vec<dim,tvec> dx = periodic_wrap<dim,tvec>(
+        xmj.pos - xmi.pos, radial_kernel_boxsize<radial_kernel_kind,tvec>(radial_kernel)
+    );
     tvec r2 = dx.norm2();
 
     Vec<2,tvec> coeffs;
@@ -55,7 +57,9 @@ __forceinline__ __device__ PosMass<dim,tvec> VJP_GFPhiToGXM(
     // gi and gj are the final gradient vectors of fphi_i and fphi_j, respectively.
     // we have to back propagate the gradient towards a gradient with respect to xmi
     // for understanding the maths, please consider the corresponding .ipynb notebook
-    Vec<dim,tvec> dx = xmj.pos - xmi.pos;
+    Vec<dim,tvec> dx = periodic_wrap<dim,tvec>(
+        xmj.pos - xmi.pos, radial_kernel_boxsize<radial_kernel_kind,tvec>(radial_kernel)
+    );
     tvec r2 = dx.norm2();
 
     Vec<3,tvec> coeffs;

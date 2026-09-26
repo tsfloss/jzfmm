@@ -44,6 +44,16 @@ def _check_kernel_config(kernel, dim: int, opening=None):
                 "WendlandC2Kernel requires opening=OpeningBySupport(support) with "
                 f"support >= {kernel.support}, got {opening}."
             )
+        if opening is not None and opening.boxsize != kernel.boxsize:
+            raise ValueError(
+                f"WendlandC2Kernel has boxsize={kernel.boxsize}, but OpeningBySupport has "
+                f"boxsize={opening.boxsize}. Both must use the same periodic box."
+            )
+    elif isinstance(opening, OpeningBySupport) and opening.boxsize is not None:
+        raise ValueError(
+            "Periodic boundaries (OpeningBySupport.boxsize) are only supported for "
+            f"WendlandC2Kernel, got {kernel}."
+        )
 
 # ------------------------------------------------------------------------------------------------ #
 #                                          M2L Evaluation                                          #

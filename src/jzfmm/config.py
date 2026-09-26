@@ -76,6 +76,14 @@ class SoftenedDistanceKernel(KernelConfig):
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.softening], dtype=dtype)
 
+def _check_boxsize(boxsize, support, name):
+    if boxsize is None:
+        return
+    # Only the nearest periodic image is considered
+    if not boxsize > 2 * support:
+        raise ValueError(f"{name} requires boxsize > 2*support, got boxsize={boxsize} "
+                         f"and support={support}")
+
 @dataclass(unsafe_hash=True, slots=True)
 class WendlandC2Kernel(KernelConfig):
     r"""Compactly supported Wendland C2 kernel for kernel density estimates.
@@ -93,16 +101,21 @@ class WendlandC2Kernel(KernelConfig):
     Args:
         support: Support radius :math:`H` beyond which the kernel vanishes.
         dim: Spatial dimension used for the normalization. Must be 2 or 3.
+        boxsize: Side length of a periodic box. Pair distances then use the
+            nearest periodic image. Must match :paramref:`OpeningBySupport.boxsize`
+            and exceed twice the support. ``None`` for open boundaries.
     """
 
     support : float = 0.1
     dim : int = 3
+    boxsize : float | None = None
 
     def __post_init__(self):
         if self.dim not in (2, 3):
             raise ValueError(f"WendlandC2Kernel supports dim=2 or dim=3, got dim={self.dim}")
         if not self.support > 0:
             raise ValueError(f"WendlandC2Kernel requires support > 0, got {self.support}")
+        _check_boxsize(self.boxsize, self.support, "WendlandC2Kernel")
 
     def norm(self) -> float:
         """Returns the normalization constant :math:`N_d`."""
@@ -114,7 +127,7 @@ class WendlandC2Kernel(KernelConfig):
         return 3
 
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
-        return jnp.asarray([self.support, self.norm()], dtype=dtype)
+        return jnp.asarray([self.support, self.norm(), self.boxsize or 0.], dtype=dtype)
 
 # ------------------------------------------------------------------------------------------------ #
 #                                              Opening                                             #
@@ -164,9 +177,16 @@ class OpeningBySupport(OpeningCriterionConfig):
     Args:
         support: Interaction radius. Must be at least the support of the
             kernel, e.g. :paramref:`WendlandC2Kernel.support`.
+        boxsize: Side length of a periodic box, so that node pairs are
+            compared through their nearest periodic image. Must match the
+            kernel's ``boxsize``. ``None`` for open boundaries.
     """
 
     support : float = 0.1
+    boxsize : float | None = None
+
+    def __post_init__(self):
+        _check_boxsize(self.boxsize, self.support, "OpeningBySupport")
 
     def kind_id(self) -> int:
         return 1
@@ -175,7 +195,7 @@ class OpeningBySupport(OpeningCriterionConfig):
         return False
 
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
-        return jnp.asarray([self.support], dtype=dtype)
+        return jnp.asarray([self.support, self.boxsize or 0.], dtype=dtype)
 
 @dataclass(unsafe_hash=True, slots=True)
 class PotentialField:

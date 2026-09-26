@@ -195,7 +195,12 @@ struct RadialKernel<RADIAL_KERNEL_WENDLAND_C2> {
             else
                 poly = tvec(0);
 
-            const tvec value = scale * (poly + c3 * pw3 + c5 * pw5);
+            tvec value = scale * (poly + c3 * pw3 + c5 * pw5);
+            if(n == 0) {
+                // The expanded form cancels near q = 1 and can become slightly negative
+                const tvec omq = tvec(1) - q;
+                value = scale * (omq * omq) * (omq * omq) * (tvec(1) + tvec(4) * q);
+            }
             coeffs[n] = inside ? value : tvec(0);
 
             c3 *= tvec(1.5) - tvec(n);

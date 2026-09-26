@@ -538,3 +538,14 @@ def test_periodic_config_validation():
         WendlandC2Kernel(support=0.6, dim=dim, boxsize=boxsize)
     with pytest.raises(ValueError, match="2\\*support"):
         OpeningBySupport(support=0.6, boxsize=boxsize)
+
+def test_wendland_nonnegative_near_support():
+    """The kernel value must not become negative through cancellation near q = 1."""
+    support, n = 0.1, 4096
+    q = jnp.linspace(0.95, 1.0, n)
+    pos = jnp.concatenate([jnp.zeros((1, 3)), jnp.stack([q * support, jnp.zeros(n), jnp.zeros(n)], -1)])
+    mass = jnp.concatenate([jnp.ones(1), jnp.zeros(n)])
+    _, cfg_direct = _configs(support, 3)
+    rho = direct_summation.jit(PosMass(pos=pos, mass=mass), cfg_direct=cfg_direct).potential()[1:]
+    assert np.all(rho >= 0)
+    np.testing.assert_allclose(rho, _wendland_ref(q**2 * support**2, support, 3), rtol=1e-3, atol=1e-7)

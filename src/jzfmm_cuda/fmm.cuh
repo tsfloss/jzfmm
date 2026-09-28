@@ -36,8 +36,8 @@ __global__ void CountInteractionsAndM2L(
     const int* ilist_isrc,
     const Node<dim,tvec>* children_recv,
     const Node<dim,tvec>* children_src,
-    const tvec* nquery_recv,
-    const tvec* nquery_src,
+    const tvec* weights_recv, // per node (number of queries, mass), stride 2
+    const tvec* weights_src,
     const tvec* mp_src,
     const tvec* radial_kernel_params,
     const tvec* opening_criterion_params,
@@ -54,6 +54,8 @@ __global__ void CountInteractionsAndM2L(
     constexpr int m2l_blocksize =
         (p == 7 && std::is_same_v<tvec, double>) ? 16 : BLOCKSIZE;
     auto opening_criterion = OpeningCriterion<opening_criterion_kind>::template make_params<tvec>(opening_criterion_params);
+    // The opening criterion ensures that the nearest image is unique for periodic M2L
+    const tvec m2l_boxsize = radial_kernel_boxsize<tvec>(radial_kernel_kind, radial_kernel_params);
 
     // Node A info:
     int2 nrange = node_range[0];
@@ -74,11 +76,13 @@ __global__ void CountInteractionsAndM2L(
         __shared__ Node<dim,tvec> childA[MAX_NUMA];
         __shared__ int scale_expA[MAX_NUMA];
         __shared__ tvec nqueryA[MAX_NUMA];
+        __shared__ tvec massA[MAX_NUMA];
         if(threadIdx.x < num_childrenA) {
             Node<dim,tvec> child = children_recv[offsetA + threadIdx.x];
             childA[threadIdx.x] = child;
             scale_expA[threadIdx.x] = expansion_exponent<dim,tvec>(child.level);
-            nqueryA[threadIdx.x] = nquery_recv[offsetA + threadIdx.x];
+            nqueryA[threadIdx.x] = weights_recv[2 * (offsetA + threadIdx.x)];
+            massA[threadIdx.x] = weights_recv[2 * (offsetA + threadIdx.x) + 1];
         }
 
         int num_open[MAX_NUMA];
@@ -150,9 +154,11 @@ __global__ void CountInteractionsAndM2L(
             // Each thread loads one other child B to check the opening criterion
             Node<dim,tvec> childB;
             tvec nqueryB = tvec(0);
+            tvec massB = tvec(0);
             if(id >= 0) {
                 childB = children_src[id];
-                nqueryB = nquery_src[id];
+                nqueryB = weights_src[2 * id];
+                massB = weights_src[2 * id + 1];
             }
 
             // For each child A, we count the cumulative number of opens and we 
@@ -169,12 +175,11 @@ __global__ void CountInteractionsAndM2L(
                 // Pairs without any query particle cannot contribute to a query result and
                 // are discarded. This is symmetric, so the leaf interaction list stays symmetric.
                 bool relevant = (id >= 0) && ((nqueryA[i] > tvec(0)) || (nqueryB > tvec(0)));
-                bool need_open = relevant && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
-                    childA[i], childB, opening_criterion
-                );
-                bool actually_open = need_open;
-                bool interact_now = !need_open && relevant
-                    && OpeningCriterion<opening_criterion_kind>::evaluates_far_field;
+                int action = relevant ? OpeningCriterion<opening_criterion_kind>::template action<dim,tvec>(
+                    childA[i], childB, max(massA[i], massB), opening_criterion
+                ) : INTERACTION_DISCARD;
+                bool actually_open = action == INTERACTION_OPEN;
+                bool interact_now = action == INTERACTION_APPROXIMATE;
                 any_interacts = any_interacts || interact_now;
 
                 // Sum over all threads
@@ -212,7 +217,7 @@ __global__ void CountInteractionsAndM2L(
                     int b_read = __fns(interact_flags_wa, 0, ib+1);
 
                     m2l_translator<p,dim,tvec>(
-                        posB[b_read] - xaWrite,
+                        periodic_wrap<dim,tvec>(posB[b_read] - xaWrite, m2l_boxsize),
                         scale_expB[b_read], scale_expA[a_write],
                         mpB[b_read], LocA,
                         radial_kernel_kind, radial_kernel_params
@@ -293,8 +298,8 @@ __global__ void InsertInteractions(
     const int* ilist_isrc,
     const Node<dim,tvec>* children_recv,
     const Node<dim,tvec>* children_src,
-    const tvec* nquery_recv,
-    const tvec* nquery_src,
+    const tvec* weights_recv, // per node (number of queries, mass), stride 2
+    const tvec* weights_src,
     const int* spl_ilist_child,
     const tvec* opening_criterion_params,
     // outputs:
@@ -321,11 +326,13 @@ __global__ void InsertInteractions(
         __shared__ Node<dim,tvec> childA[MAX_NUMA];
         __shared__ int ilist_offsets[MAX_NUMA];
         __shared__ tvec nqueryA[MAX_NUMA];
+        __shared__ tvec massA[MAX_NUMA];
         if(threadIdx.x < num_childrenA) {
             Node<dim,tvec> child = children_recv[offsetA + threadIdx.x];
             childA[threadIdx.x] = child;
             ilist_offsets[threadIdx.x] = spl_ilist_child[offsetA + threadIdx.x];
-            nqueryA[threadIdx.x] = nquery_recv[offsetA + threadIdx.x];
+            nqueryA[threadIdx.x] = weights_recv[2 * (offsetA + threadIdx.x)];
+            massA[threadIdx.x] = weights_recv[2 * (offsetA + threadIdx.x) + 1];
         }
 
         int num_open[MAX_NUMA];
@@ -354,9 +361,11 @@ __global__ void InsertInteractions(
             // Each thread loads one other child B to check the opening criterion
             Node<dim,tvec> childB;
             tvec nqueryB = tvec(0);
+            tvec massB = tvec(0);
             if(id >= 0) {
                 childB = children_src[id];
-                nqueryB = nquery_src[id];
+                nqueryB = weights_src[2 * id];
+                massB = weights_src[2 * id + 1];
             }
 
             #pragma unroll
@@ -367,9 +376,9 @@ __global__ void InsertInteractions(
                 // Pairs without any query particle cannot contribute to a query result and
                 // are discarded. This is symmetric, so the leaf interaction list stays symmetric.
                 bool relevant = (id >= 0) && ((nqueryA[i] > tvec(0)) || (nqueryB > tvec(0)));
-                bool need_open = relevant && OpeningCriterion<opening_criterion_kind>::template should_open<dim,tvec>(
-                    childA[i], childB, opening_criterion
-                );
+                bool need_open = relevant && OpeningCriterion<opening_criterion_kind>::template action<dim,tvec>(
+                    childA[i], childB, max(massA[i], massB), opening_criterion
+                ) == INTERACTION_OPEN;
 
                 unsigned open_mask = __ballot_sync(ALLTHREADS, need_open);
 

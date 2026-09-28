@@ -16,7 +16,8 @@ from jztree.comm import all_to_all_request_children, all_to_all_with_irank, get_
 from jztree.stats import AllocStats, stats_callback
 from jax.sharding import PartitionSpec as P
 
-from .config import DirectSummationConfig, FMMConfig, OpeningBySupport, WendlandC2Kernel
+from .config import (DirectSummationConfig, FMMConfig, GaussianKernel, OpeningByAngle,
+                     OpeningByGaussianError, OpeningBySupport, WendlandC2Kernel)
 from .data import LocalExpansion
 from .multipoles import _fmm_node_to_child, _shift_local_to_children_vjp_x, build_multipole_hierarchy, num_multi, p_of_num_multi
 
@@ -49,11 +50,29 @@ def _check_kernel_config(kernel, dim: int, opening=None):
                 f"WendlandC2Kernel has boxsize={kernel.boxsize}, but OpeningBySupport has "
                 f"boxsize={opening.boxsize}. Both must use the same periodic box."
             )
+    elif isinstance(kernel, GaussianKernel):
+        if kernel.dim != dim:
+            raise ValueError(
+                f"GaussianKernel is normalized for dim={kernel.dim}, but the particles "
+                f"have dim={dim}."
+            )
+        if isinstance(opening, OpeningBySupport) and opening.boxsize != kernel.boxsize:
+            raise ValueError(
+                f"GaussianKernel has boxsize={kernel.boxsize}, but OpeningBySupport has "
+                f"boxsize={opening.boxsize}. Both must use the same periodic box."
+            )
+        if kernel.boxsize is not None and isinstance(opening, OpeningByAngle):
+            raise ValueError(
+                "Periodic boundaries with GaussianKernel require OpeningByGaussianError or "
+                "OpeningBySupport, since OpeningByAngle does not ensure unique nearest images."
+            )
     elif isinstance(opening, OpeningBySupport) and opening.boxsize is not None:
         raise ValueError(
             "Periodic boundaries (OpeningBySupport.boxsize) are only supported for "
-            f"WendlandC2Kernel, got {kernel}."
+            f"WendlandC2Kernel and GaussianKernel, got {kernel}."
         )
+    if isinstance(opening, OpeningByGaussianError) and not isinstance(kernel, GaussianKernel):
+        raise ValueError(f"OpeningByGaussianError requires a GaussianKernel, got {kernel}.")
 
 # ------------------------------------------------------------------------------------------------ #
 #                                          M2L Evaluation                                          #
@@ -64,8 +83,9 @@ def _check_kernel_config(kernel, dim: int, opening=None):
 class _FMMChildData:
     poslvl: PosLvl
     mp: jax.Array
-    # Number of query particles per node. Pairs of nodes without queries are discarded.
-    nquery: jax.Array
+    # Per node (number of query particles, mass). Pairs of nodes without queries are
+    # discarded. The mass is only used by mass-dependent opening criteria.
+    weights: jax.Array
 
 def _comm_buffer_size(base_size: int, factor: float) -> int:
     return max(base_size, int(np.ceil(base_size * factor)))
@@ -131,7 +151,7 @@ def _fmm_node_to_node(
     dtype = child_src.mp.dtype
     kernel_params = kernel.params(dtype=dtype)
     opening = cfg_fmm.opening
-    opening_params = opening.params(dtype=dtype)
+    opening_params = opening.params_for(cfg_fmm, dtype=dtype)
     out_loc = jax.ShapeDtypeStruct((size, num_multi(cfg_fmm.p, dim=dim)), dtype)
     if loc_in is None:
         loc_in = jnp.zeros(out_loc.shape, dtype=out_loc.dtype)
@@ -145,7 +165,7 @@ def _fmm_node_to_node(
         input_output_aliases={13: 0},
     )(
         node_range, spl_recv, spl_src, ilist_ispl, ilist_isrc,
-        children_recv, children_src, child_recv.nquery, child_src.nquery,
+        children_recv, children_src, child_recv.weights, child_src.weights,
         child_src.mp, kernel_params, opening_params,
         single_thread_per_receiver, loc_in,
         p=np.int32(cfg_fmm.p),
@@ -167,7 +187,7 @@ def _fmm_node_to_node(
         (out_child_ilist,)
     )(
         node_range, spl_recv, spl_src, ilist_ispl, ilist_isrc,
-        children_recv, children_src, child_recv.nquery, child_src.nquery,
+        children_recv, children_src, child_recv.weights, child_src.weights,
         ispl_child, opening_params,
         opening_criterion_kind=np.int32(opening.kind_id()),
     )[0]
@@ -196,9 +216,15 @@ def _fmm_node_to_node(
 _fmm_node_to_node.jit = jax.jit(_fmm_node_to_node, static_argnames=['cfg_fmm'])
 
 def _fmm_dual_walk(
-        th: TreeHierarchy, mph: PackedArray, cfg_fmm: FMMConfig, qh: PackedArray | None = None
+        th: TreeHierarchy, mph: PackedArray, cfg_fmm: FMMConfig, qh: PackedArray | None = None,
+        mh: PackedArray | None = None
     ):
-    """Dual tree walk. qh optionally holds the number of query particles per node."""
+    """Dual tree walk.
+
+    qh and mh optionally hold the number of query particles and the mass per node. Both must
+    not depend on mph, since the backward pass repeats the walk with cotangent multipoles and
+    has to make the same opening decisions.
+    """
     in_smap = in_shard_map_context()
     if in_smap:
         rank, ndev, axis_name = get_rank_info()
@@ -249,10 +275,14 @@ def _fmm_dual_walk(
             nquery = jnp.ones(size, dtype=mph.data.dtype)
         else:
             nquery = qh.get(level, size=size, fill_value=0.)[:, 0]
+        if mh is None:
+            mass = jnp.zeros(size, dtype=mph.data.dtype)
+        else:
+            mass = mh.get(level, size=size, fill_value=0.)[:, 0]
         child_recv = _FMMChildData(
             poslvl=th.poslvl(level, size),
             mp=mph.get(level, size=size),
-            nquery=pcast_like(nquery, mph.data),
+            weights=pcast_like(jnp.stack([nquery, mass], axis=-1), mph.data),
         )
 
         if in_smap:
@@ -615,17 +645,25 @@ def _query_hierarchy(th: TreeHierarchy, pos: jax.Array, query_mask: jax.Array, c
                      ) -> PackedArray:
     """Number of query particles per node, as the monopoles of the query indicator."""
     weights = jnp.asarray(query_mask, dtype=pos.dtype)
+    return _weight_hierarchy(th, pos, weights, cfg_fmm)
+
+def _weight_hierarchy(th: TreeHierarchy, pos: jax.Array, weights: jax.Array, cfg_fmm: FMMConfig
+                      ) -> PackedArray:
+    """Sum of the particle weights per node, without gradients. Only the monopole is used."""
+    weights = jnp.broadcast_to(jnp.asarray(weights, dtype=pos.dtype), pos.shape[:1])
     return build_multipole_hierarchy(
-        th, jax.lax.stop_gradient(pos), jax.lax.stop_gradient(weights), cfg_fmm=cfg_fmm
+        th, jax.lax.stop_gradient(pos), jax.lax.stop_gradient(weights),
+        cfg_fmm=replace(cfg_fmm, p=1)
     )
 
 def _evaluate_node_node_fmm(
-        partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig, qh: PackedArray | None = None
+        partz: PosMass, th: TreeHierarchy, *, cfg_fmm: FMMConfig, qh: PackedArray | None = None,
+        mh: PackedArray | None = None
     ) -> Tuple[jax.Array, InteractionList]:
     
     def eval_fwd(pos, mp, pout=1):
         mph = build_multipole_hierarchy(th, pos, mp, cfg_fmm=cfg_fmm)
-        loc_node, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh)
+        loc_node, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh, mh=mh)
         ispl = th.splits_leaf_to_part()
         node = th.poslvl(0)
         # Particle scale H=1 makes the L2P output use physical derivative units.
@@ -667,9 +705,10 @@ def _fast_multipole_method_z(
     dim = partz.pos.shape[-1]
 
     qh = None if query_mask is None else _query_hierarchy(th, partz.pos, query_mask, cfg_fmm)
+    mh = _weight_hierarchy(th, partz.pos, partz.mass, cfg_fmm) if cfg_fmm.opening.uses_node_mass() else None
 
     if cfg_fmm.opening.evaluates_far_field():
-        loc_node_node, ilist = _evaluate_node_node_fmm(partz, th, cfg_fmm=cfg_fmm, qh=qh)
+        loc_node_node, ilist = _evaluate_node_node_fmm(partz, th, cfg_fmm=cfg_fmm, qh=qh, mh=mh)
     else:
         # Without far-field interactions the node-node part only determines the leaf
         # interaction list. It contributes nothing to the result or to its gradients.
@@ -682,7 +721,7 @@ def _fast_multipole_method_z(
             mph = build_multipole_hierarchy(
                 th, jax.lax.stop_gradient(partz.pos), jax.lax.stop_gradient(mp), cfg_fmm=cfg_fmm
             )
-        _, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh)
+        _, ilist = _fmm_dual_walk(th, mph, cfg_fmm=cfg_fmm, qh=qh, mh=mh)
         loc_node_node = jnp.zeros((partz.pos.shape[0], num_multi(pout, dim=dim)), dtype=mph.data.dtype)
         loc_node_node = pcast_like(loc_node_node, partz.pos)
     spl = th.splits_leaf_to_part()

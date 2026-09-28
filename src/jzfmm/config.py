@@ -129,6 +129,49 @@ class WendlandC2Kernel(KernelConfig):
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.support, self.norm(), self.boxsize or 0.], dtype=dtype)
 
+@dataclass(unsafe_hash=True, slots=True)
+class GaussianKernel(KernelConfig):
+    r"""Gaussian kernel for kernel density estimates.
+
+    Implements :math:`K(r)=(2\pi\sigma^2)^{-d/2}\exp(-r^2/(2\sigma^2))`, normalized to unit
+    integral. As for :class:`WendlandC2Kernel`, the returned potential is the density
+    :math:`\sum_j m_j K(|x-x_j|)` and the returned force is its negative gradient.
+
+    Unlike compact kernels, the Gaussian is non-zero everywhere, so densities stay positive
+    and smooth also far from all particles. Use it with :class:`OpeningByGaussianError`,
+    which approximates distant node pairs through multipoles with a controlled absolute
+    error, or with :class:`OpeningBySupport` to truncate it at a fixed radius.
+
+    Args:
+        sigma: Standard deviation :math:`\sigma` of the Gaussian.
+        dim: Spatial dimension used for the normalization. Must be 2 or 3.
+        boxsize: Side length of a periodic box. Pair distances then use the nearest periodic
+            image, which requires ``boxsize > 12*sigma``. Must match the ``boxsize`` of the
+            opening criterion. ``None`` for open boundaries.
+    """
+
+    sigma : float = 0.1
+    dim : int = 3
+    boxsize : float | None = None
+
+    def __post_init__(self):
+        if self.dim not in (2, 3):
+            raise ValueError(f"GaussianKernel supports dim=2 or dim=3, got dim={self.dim}")
+        if not self.sigma > 0:
+            raise ValueError(f"GaussianKernel requires sigma > 0, got {self.sigma}")
+        # Beyond 6 sigma, the neglected images contribute less than 1e-8 of the peak
+        _check_boxsize(self.boxsize, 6. * self.sigma, "GaussianKernel")
+
+    def norm(self) -> float:
+        """Returns the normalization constant :math:`(2\\pi\\sigma^2)^{-d/2}`."""
+        return (2. * math.pi * self.sigma**2)**(-self.dim / 2)
+
+    def kind_id(self) -> int:
+        return 4
+
+    def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        return jnp.asarray([self.sigma, self.norm(), self.boxsize or 0.], dtype=dtype)
+
 # ------------------------------------------------------------------------------------------------ #
 #                                              Opening                                             #
 # ------------------------------------------------------------------------------------------------ #
@@ -143,9 +186,15 @@ class OpeningCriterionConfig:
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         """Returns criterion parameters in the requested dtype."""
         raise NotImplementedError
+    def params_for(self, cfg_fmm: FMMConfig, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        """Returns criterion parameters, which may depend on the kernel and expansion order."""
+        return self.params(dtype=dtype)
     def evaluates_far_field(self) -> bool:
         """Whether node pairs that are not opened interact through multipoles."""
         return True
+    def uses_node_mass(self) -> bool:
+        """Whether the criterion depends on the node masses."""
+        return False
 
 @dataclass(unsafe_hash=True, slots=True)
 class OpeningByAngle(OpeningCriterionConfig):
@@ -196,6 +245,62 @@ class OpeningBySupport(OpeningCriterionConfig):
 
     def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
         return jnp.asarray([self.support, self.boxsize or 0.], dtype=dtype)
+
+@dataclass(unsafe_hash=True, slots=True)
+class OpeningByGaussianError(OpeningCriterionConfig):
+    r"""Error-controlled opening criterion for :class:`GaussianKernel`.
+
+    The multipole error of the Gaussian does not depend on the opening angle, but on the
+    node size relative to :math:`\sigma` and on the distance in units of :math:`\sigma`.
+    For each node pair, with :math:`M` the larger of the two node masses, :math:`\rho\sigma`
+    half the diagonal of the summed node extents and :math:`t\sigma` the minimum distance
+    between the node boxes, the pair is
+
+    - discarded if :math:`M N e^{-t^2/2}\le` ``tol``, since it cannot contribute more,
+    - approximated through multipoles if the bound on the Taylor remainder of order
+      :math:`n=p+1`, :math:`M N \rho^n/n!\, g_n(t)\le` ``tol``, with
+      :math:`g_n(t)=\min(1.0865\sqrt{n!}\,e^{-t^2/4},\,(t^2+n)^{n/2}e^{-t^2/2})`,
+    - opened otherwise.
+
+    Here :math:`N` is the kernel normalization. The per-pair bound is rigorous for the
+    density and within a factor of about 1.5 of the worst case. The error at a query
+    accumulates over all its node pairs, but the individual errors have varying signs, so
+    the total error is typically of order ``tol`` (see ``checks/accuracy_checks/kde_gaussian.py``).
+    Discarded pairs always bias the density low, by at most ``tol`` per pair.
+
+    ``tol`` is an absolute tolerance in units of the density, e.g. a small fraction of the
+    mean density. The kernel parameters are taken from :attr:`FMMConfig.kernel`, which must
+    be a :class:`GaussianKernel`. Periodic boundaries follow its ``boxsize``.
+
+    Args:
+        tol: Absolute density tolerance per node pair.
+    """
+
+    tol : float = 1e-3
+
+    def __post_init__(self):
+        if not self.tol > 0:
+            raise ValueError(f"OpeningByGaussianError requires tol > 0, got {self.tol}")
+
+    def kind_id(self) -> int:
+        return 2
+
+    def uses_node_mass(self) -> bool:
+        return True
+
+    def params(self, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        raise TypeError("OpeningByGaussianError depends on the kernel, use params_for(cfg_fmm)")
+
+    def params_for(self, cfg_fmm: FMMConfig, dtype: jax.typing.DTypeLike = jnp.float32) -> jax.Array:
+        kernel = cfg_fmm.kernel
+        if not isinstance(kernel, GaussianKernel):
+            raise TypeError(f"OpeningByGaussianError requires a GaussianKernel, got {kernel}")
+        n = cfg_fmm.p + 1
+        log_nfact = math.lgamma(n + 1)
+        return jnp.asarray([
+            kernel.sigma, math.log(self.tol / kernel.norm()), kernel.boxsize or 0., n,
+            -log_nfact, math.log(1.0865) + 0.5 * log_nfact,
+        ], dtype=dtype)
 
 @dataclass(unsafe_hash=True, slots=True)
 class PotentialField:

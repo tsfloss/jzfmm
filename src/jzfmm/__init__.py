@@ -1,4 +1,4 @@
-from .config import DirectSummationConfig, DKDConfig, DKDLatticeConfig, FMMConfig, IntegratorConfig, KDKConfig, KernelConfig, OpeningCriterionConfig, OpeningByAngle, OpeningBySupport, PlummerKernel, Plummer2DKernel, SimConfig, SoftenedDistanceKernel, UnitConfig, WendlandC2Kernel
+from .config import DirectSummationConfig, DKDConfig, DKDLatticeConfig, FMMConfig, GaussianKernel, IntegratorConfig, KDKConfig, KernelConfig, OpeningCriterionConfig, OpeningByAngle, OpeningByGaussianError, OpeningBySupport, PlummerKernel, Plummer2DKernel, SimConfig, SoftenedDistanceKernel, UnitConfig, WendlandC2Kernel
 from . import data
 from . import multipoles
 from . import fmm

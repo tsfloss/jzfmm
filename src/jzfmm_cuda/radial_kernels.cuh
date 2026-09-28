@@ -7,6 +7,7 @@ static constexpr int RADIAL_KERNEL_PLUMMER = 0;
 static constexpr int RADIAL_KERNEL_PLUMMER_2D = 1;
 static constexpr int RADIAL_KERNEL_SOFTENED_DISTANCE = 2;
 static constexpr int RADIAL_KERNEL_WENDLAND_C2 = 3;
+static constexpr int RADIAL_KERNEL_GAUSSIAN = 4;
 
 // Minimum-image convention: wraps each component of a displacement into
 // [-boxsize/2, boxsize/2]. boxsize <= 0 disables wrapping.
@@ -212,16 +213,63 @@ struct RadialKernel<RADIAL_KERNEL_WENDLAND_C2> {
     }
 };
 
+template<>
+struct RadialKernel<RADIAL_KERNEL_GAUSSIAN> {
+    template<typename tvec>
+    struct Params {
+        tvec sigma;
+        tvec norm;
+        tvec boxsize; // periodic box size, <= 0 if not periodic
+    };
+
+    template<typename tvec>
+    __device__ __forceinline__ static Params<tvec> make_params(const tvec* params) {
+        return Params<tvec>{params[0], params[1], params[2]};
+    }
+
+    template<int p, typename tvec>
+    __device__ __forceinline__ static void r2_derivative_coeffs(
+        tvec scaled_r2,
+        Params<tvec> params,
+        Vec<p+1,tvec>& coeffs,
+        int scale_exp = 0
+    ) {
+        // s = r^2 / R^2, R = 2^scale_exp
+        // coeffs[n] = 2^n d^n/ds^n K(R sqrt(s)).
+        // With sigma' = sigma / R: K = norm exp(-s / (2 sigma'^2)), so each 2 d/ds
+        // contributes a factor -1/sigma'^2.
+        const tvec sigma = params.sigma * normal_pow2<tvec>(-scale_exp);
+        const tvec a = -tvec(1) / (sigma * sigma);
+        tvec value = params.norm * exp(tvec(0.5) * a * scaled_r2);
+
+        #pragma unroll
+        for(int n = 0; n <= p; n++) {
+            coeffs[n] = value;
+            value *= a;
+        }
+    }
+};
+
 // Periodic box size used for pair displacements, or 0 for open boundaries.
-// Only compactly supported kernels can be periodic, since they have no far field.
+// Kernels with a far field can only be periodic if their opening criterion ensures that the
+// nearest image is unique for all M2L interactions (see OPENING_BY_GAUSSIAN_ERROR).
 template<int radial_kernel_kind, typename tvec>
 __device__ __forceinline__ tvec radial_kernel_boxsize(
     const typename RadialKernel<radial_kernel_kind>::template Params<tvec>& params
 ) {
-    if constexpr (radial_kernel_kind == RADIAL_KERNEL_WENDLAND_C2)
+    if constexpr (radial_kernel_kind == RADIAL_KERNEL_WENDLAND_C2
+                  || radial_kernel_kind == RADIAL_KERNEL_GAUSSIAN)
         return params.boxsize;
     else
         return tvec(0);
+}
+
+// Same as radial_kernel_boxsize, for a runtime kernel kind and raw parameters
+template<typename tvec>
+__device__ __forceinline__ tvec radial_kernel_boxsize(int radial_kernel_kind, const tvec* params) {
+    if(radial_kernel_kind == RADIAL_KERNEL_WENDLAND_C2 || radial_kernel_kind == RADIAL_KERNEL_GAUSSIAN)
+        return params[2];
+    return tvec(0);
 }
 
 template<int p, typename tvec>
@@ -235,6 +283,13 @@ __device__ __forceinline__ void evaluate_radial_kernel_derivatives(
     // s = scaled_r2 = r^2 / R^2, R = 2^scale_exp
     // coeffs[n] = 2^n d^n/ds^n K(R sqrt(s)).
     switch(radial_kernel_kind) {
+        case RADIAL_KERNEL_GAUSSIAN: {
+            auto kernel_params = RadialKernel<RADIAL_KERNEL_GAUSSIAN>::template make_params<tvec>(params);
+            RadialKernel<RADIAL_KERNEL_GAUSSIAN>::template r2_derivative_coeffs<p,tvec>(
+                scaled_r2, kernel_params, coeffs, scale_exp
+            );
+            break;
+        }
         case RADIAL_KERNEL_WENDLAND_C2: {
             auto kernel_params = RadialKernel<RADIAL_KERNEL_WENDLAND_C2>::template make_params<tvec>(params);
             RadialKernel<RADIAL_KERNEL_WENDLAND_C2>::template r2_derivative_coeffs<p,tvec>(

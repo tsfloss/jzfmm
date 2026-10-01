@@ -252,7 +252,8 @@ class OpeningByGaussianError(OpeningCriterionConfig):
 
     The multipole error of the Gaussian does not depend on the opening angle, but on the
     node size relative to :math:`\sigma` and on the distance in units of :math:`\sigma`.
-    For each node pair, with :math:`M` the larger of the two node masses, :math:`\rho\sigma`
+    For each node pair, with :math:`M` the larger of the two node masses (sums of absolute
+    particle masses, so that mixed-sign weights are bounded correctly), :math:`\rho\sigma`
     half the diagonal of the summed node extents and :math:`t\sigma` the minimum distance
     between the node boxes, the pair is
 
@@ -264,9 +265,10 @@ class OpeningByGaussianError(OpeningCriterionConfig):
 
     Here :math:`N` is the kernel normalization. The per-pair bound is rigorous for the
     density and within a factor of about 1.5 of the worst case. The error at a query
-    accumulates over all its node pairs, but the individual errors have varying signs, so
-    the total error is typically of order ``tol`` (see ``checks/accuracy_checks/kde_gaussian.py``).
-    Discarded pairs always bias the density low, by at most ``tol`` per pair.
+    accumulates over all its node pairs. Multipole errors have varying signs, but discarded
+    pairs all bias the density low, by at most ``tol`` each. In 3D the total error typically
+    stays below ``tol``, while in 2D the discard bias can exceed it by a factor of a few.
+    Densities far below ``tol`` are not resolved and may be returned as zero.
 
     ``tol`` is an absolute tolerance in units of the density, e.g. a small fraction of the
     mean density. The kernel parameters are taken from :attr:`FMMConfig.kernel`, which must

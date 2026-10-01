@@ -117,8 +117,9 @@ def summarize_multipoles(
     return eval(child.pos, mp)
 summarize_multipoles.jit = jax.jit(summarize_multipoles, static_argnames=['cfg_fmm', ])
 
-def build_multipole_hierarchy(th: TreeHierarchy, pos: jax.Array, mp: jax.Array, cfg_fmm: FMMConfig
-                              ) -> PackedArray:
+def build_multipole_hierarchy(th: TreeHierarchy, pos: jax.Array, mp: jax.Array, cfg_fmm: FMMConfig,
+                              ptype: int = 0) -> PackedArray:
+    """Multipoles of all nodes, from the particles of type ptype."""
     mp = _as_particle_multipoles(mp, pos)
 
     dim = pos.shape[-1]
@@ -127,7 +128,7 @@ def build_multipole_hierarchy(th: TreeHierarchy, pos: jax.Array, mp: jax.Array, 
     # Particle multipoles contain only degree zero, so their unit scale is immaterial here.
     particles = PosLvl(pos=pos, lvl=jnp.zeros(pos.shape[0], dtype=jnp.int32))
     mp0 = summarize_multipoles(
-        th.splits_leaf_to_part(size=size+1), mp, leaf_nodes, particles, cfg_fmm=cfg_fmm
+        th.splits_leaf_to_part(ptype, size=size+1), mp, leaf_nodes, particles, cfg_fmm=cfg_fmm
     )
 
     mph = PackedArray.create_empty(
@@ -147,7 +148,7 @@ def build_multipole_hierarchy(th: TreeHierarchy, pos: jax.Array, mp: jax.Array, 
     mph = jax.lax.fori_loop(1, th.num_planes(), handle_level, mph)
     
     return mph
-build_multipole_hierarchy.jit = jax.jit(build_multipole_hierarchy, static_argnames=['cfg_fmm'])
+build_multipole_hierarchy.jit = jax.jit(build_multipole_hierarchy, static_argnames=['cfg_fmm', 'ptype'])
 
 def _shift_local_to_children_impl(
         ispl: jnp.array,

@@ -140,3 +140,33 @@ gen.generate_ffi_module_file(
     functions = kernels, 
     includes = default_includes + ["../multipoles.cuh"]
 )
+
+# ------------------------------------------------------------------------------------------------ #
+#                                         pair_counting.cuh                                        #
+# ------------------------------------------------------------------------------------------------ #
+
+kernels = parse.get_functions_from_file(
+    str(HERE / "pair_counting.cuh"),
+    only_kernels=True
+)
+
+k = kernels["LeafLeafPairCount"]
+k.grid_size_expression = "spl_recv.element_count() - 1"
+k.par["nbins"].expression = "r2_edges.element_count() - 1"
+k.par["counts"].init_zero = True
+k.par["wcounts"].init_zero = True
+# source particles | r2 edges | per-warp histograms (counts and weights) | source ids | lut
+k.smem_size_expression = (
+    f"(nbins + 1 + blockDim.x * (dim + 1)) * {dtype_size_expression('posm_src')}"
+    " + div_ceil(blockDim.x, 32) * nbins * 2 * sizeof(float) + blockDim.x * sizeof(int)"
+    " + bin_lut.element_count() * sizeof(unsigned short)"
+)
+k.template_par["dim"].instances = dimensions
+k.template_par["dim"].expression = "posm_recv.dimensions()[1] - 1"
+add_dtype_template(k, "posm_recv", float_types_direct)
+
+gen.generate_ffi_module_file(
+    output_file = str(HERE / "generated/ffi_pair_counting.cu"),
+    functions = kernels,
+    includes = default_includes + ["../pair_counting.cuh"]
+)

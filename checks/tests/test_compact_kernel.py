@@ -310,23 +310,33 @@ def _clustered_positions(key, n, dim):
     return jnp.where(jnp.arange(n)[:, None] < 0.7 * n, x, jax.random.uniform(k1, (n, dim)))
 
 @pytest.mark.shrink_in_quick(keep_index=1)
-@pytest.mark.parametrize("ic", ("uniform", "clustered"))
+@pytest.mark.parametrize("method", ("two_type", "zero_mass"))
+@pytest.mark.parametrize("ic", ("uniform", "clustered", "many_queries"))
 @pytest.mark.parametrize("dim", (2, 3))
-def test_evaluate_at_positions(dim, ic):
+def test_evaluate_at_positions(dim, ic, method):
     nbody, ntracer = 2**14, 500
     support = _support_for_neighbours(nbody, dim)
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(4), 3)
     if ic == "uniform":
         pos = jax.random.uniform(k1, (nbody, dim))
         tr = jax.random.uniform(k2, (ntracer, dim))
-    else:
+    elif ic == "clustered":
         pos = _clustered_positions(k1, nbody, dim)
         tr = pos[:ntracer] + 0.3 * support * jax.random.normal(k2, (ntracer, dim))
+    else:
+        # Many more queries than sources, clustered on a few sources and partly empty space
+        nbody, ntracer = 2**11, 2**14
+        support = _support_for_neighbours(nbody, dim)
+        pos = _clustered_positions(k1, nbody, dim)
+        tr = jnp.concatenate([
+            pos[jnp.arange(ntracer // 2) % 64] + support * jax.random.normal(k2, (ntracer // 2, dim)),
+            jax.random.uniform(k2, (ntracer - ntracer // 2, dim)),
+        ])
     mass = jax.random.uniform(k3, (nbody,), minval=0.5, maxval=1.5) / nbody
     cfg_fmm, _ = _configs(support, dim)
     cfg_fmm.alloc_fac_ilist = 256.
 
-    loc = evaluate_at_positions.jit(PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm)
+    loc = evaluate_at_positions.jit(PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm, method=method)
     rho = lambda x: _density_ref(x, pos, mass, support, dim)
     rho_ref = rho(tr)
     grad_ref = jax.vmap(jax.grad(lambda xi: rho(xi[None])[0]))(tr)
@@ -337,9 +347,10 @@ def test_evaluate_at_positions(dim, ic):
         loc.values[:, 1:], grad_ref, rtol=1e-3, atol=1e-5 * float(jnp.max(jnp.abs(grad_ref)))
     )
 
+@pytest.mark.parametrize("method", ("two_type", "zero_mass"))
 @pytest.mark.parametrize("with_force", (False, True))
 @pytest.mark.parametrize("dim", (2, 3))
-def test_evaluate_at_positions_gradients(dim, with_force):
+def test_evaluate_at_positions_gradients(dim, with_force, method):
     nbody, ntracer = 4096, 300
     support = _support_for_neighbours(nbody, dim)
     k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(9), 4)
@@ -358,7 +369,9 @@ def test_evaluate_at_positions_gradients(dim, with_force):
         return loss
 
     def loss_fmm(pos, mass, tr):
-        return loss_from_values(evaluate_at_positions(PosMass(pos=pos, mass=mass), tr, cfg_fmm).values)
+        return loss_from_values(
+            evaluate_at_positions(PosMass(pos=pos, mass=mass), tr, cfg_fmm, method=method).values
+        )
 
     def loss_direct(pos, mass, tr):
         part = PosMass(pos=jnp.concatenate([pos, tr]),
@@ -372,6 +385,37 @@ def test_evaluate_at_positions_gradients(dim, with_force):
         np.testing.assert_allclose(
             a, b, rtol=2e-3, atol=2e-4 * float(jnp.max(jnp.abs(b))), err_msg=name
         )
+
+@pytest.mark.parametrize("method", ("two_type", "zero_mass"))
+def test_evaluate_at_positions_far_field(method):
+    """Far-field (M2L) interactions from the sources onto the queries, and their gradients."""
+    dim, nbody, ntracer = 3, 8192, 2048
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(11), 4)
+    pos = _clustered_positions(k1, nbody, dim)
+    tr = jnp.concatenate([pos[:ntracer // 2] + 0.01 * jax.random.normal(k2, (ntracer // 2, dim)),
+                          jax.random.uniform(k2, (ntracer // 2, dim))])
+    mass = jax.random.uniform(k3, (nbody,), minval=0.5, maxval=1.5) / nbody
+    w = jax.random.normal(k4, (ntracer,))
+    kernel = PlummerKernel(softening=0.01)
+    cfg_fmm = FMMConfig(kernel=kernel, p=5, opening=OpeningByAngle(theta=0.4), alloc_fac_ilist=256.)
+    cfg_direct = DirectSummationConfig(kernel=kernel)
+
+    def loss_fmm(pos, mass, tr):
+        values = evaluate_at_positions(PosMass(pos=pos, mass=mass), tr, cfg_fmm, method=method).values
+        return jnp.sum(w * values[:, 0]), values
+
+    def loss_direct(pos, mass, tr):
+        part = PosMass(pos=jnp.concatenate([pos, tr]), mass=jnp.concatenate([mass, jnp.zeros(ntracer)]))
+        values = direct_summation(part, cfg_direct=cfg_direct).values[nbody:]
+        return jnp.sum(w * values[:, 0]), values
+
+    g, values = jax.jit(jax.grad(loss_fmm, argnums=(0, 1, 2), has_aux=True))(pos, mass, tr)
+    g_ref, values_ref = jax.jit(jax.grad(loss_direct, argnums=(0, 1, 2), has_aux=True))(pos, mass, tr)
+    np.testing.assert_allclose(values, values_ref, rtol=1e-3,
+                               atol=1e-4 * float(jnp.max(jnp.abs(values_ref))))
+    for name, a, b in zip(("pos", "mass", "tracer pos"), g, g_ref):
+        assert np.isfinite(a).all(), name
+        np.testing.assert_allclose(a, b, rtol=1e-2, atol=1e-3 * float(jnp.max(jnp.abs(b))), err_msg=name)
 
 def test_query_mask_marks_other_particles_nan():
     dim, nbody, ntracer = 3, 4096, 256
@@ -463,8 +507,12 @@ def test_periodic_vs_reference(dim):
     loc_direct = direct_summation.jit(part, cfg_direct=cfg_direct).values[nbody:]
     loc_fmm = fast_multipole_method.jit(part, cfg_fmm=cfg_fmm).values[nbody:]
     loc_eval = evaluate_at_positions.jit(PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm).values
+    loc_eval_zm = evaluate_at_positions.jit(
+        PosMass(pos=pos, mass=mass), tr, cfg_fmm=cfg_fmm, method="zero_mass"
+    ).values
 
-    for name, loc in (("direct", loc_direct), ("fmm", loc_fmm), ("evaluate_at_positions", loc_eval)):
+    for name, loc in (("direct", loc_direct), ("fmm", loc_fmm), ("evaluate_at_positions", loc_eval),
+                      ("evaluate_at_positions zero_mass", loc_eval_zm)):
         np.testing.assert_allclose(
             loc[:, 0], rho_ref, rtol=1e-4, atol=1e-5 * float(jnp.max(rho_ref)), err_msg=name
         )

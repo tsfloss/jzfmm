@@ -37,8 +37,8 @@ ffi::Error CountInteractionsAndM2LFFIHost(
     ffi::AnyBuffer ilist_isrc,
     ffi::AnyBuffer children_recv,
     ffi::AnyBuffer children_src,
-    ffi::AnyBuffer nquery_recv,
-    ffi::AnyBuffer nquery_src,
+    ffi::AnyBuffer weights_recv,
+    ffi::AnyBuffer weights_src,
     ffi::AnyBuffer mp_src,
     ffi::AnyBuffer radial_kernel_params,
     ffi::AnyBuffer opening_criterion_params,
@@ -67,8 +67,8 @@ ffi::Error CountInteractionsAndM2LFFIHost(
     void* ilist_isrc_arg = ilist_isrc.untyped_data();
     void* children_recv_arg = children_recv.untyped_data();
     void* children_src_arg = children_src.untyped_data();
-    void* nquery_recv_arg = nquery_recv.untyped_data();
-    void* nquery_src_arg = nquery_src.untyped_data();
+    void* weights_recv_arg = weights_recv.untyped_data();
+    void* weights_src_arg = weights_src.untyped_data();
     void* mp_src_arg = mp_src.untyped_data();
     void* radial_kernel_params_arg = radial_kernel_params.untyped_data();
     void* opening_criterion_params_arg = opening_criterion_params.untyped_data();
@@ -84,8 +84,8 @@ ffi::Error CountInteractionsAndM2LFFIHost(
         &ilist_isrc_arg,
         &children_recv_arg,
         &children_src_arg,
-        &nquery_recv_arg,
-        &nquery_src_arg,
+        &weights_recv_arg,
+        &weights_src_arg,
         &mp_src_arg,
         &radial_kernel_params_arg,
         &opening_criterion_params_arg,
@@ -192,8 +192,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // ilist_isrc
         .Arg<ffi::AnyBuffer>() // children_recv
         .Arg<ffi::AnyBuffer>() // children_src
-        .Arg<ffi::AnyBuffer>() // nquery_recv
-        .Arg<ffi::AnyBuffer>() // nquery_src
+        .Arg<ffi::AnyBuffer>() // weights_recv
+        .Arg<ffi::AnyBuffer>() // weights_src
         .Arg<ffi::AnyBuffer>() // mp_src
         .Arg<ffi::AnyBuffer>() // radial_kernel_params
         .Arg<ffi::AnyBuffer>() // opening_criterion_params
@@ -221,8 +221,8 @@ ffi::Error InsertInteractionsFFIHost(
     ffi::AnyBuffer ilist_isrc,
     ffi::AnyBuffer children_recv,
     ffi::AnyBuffer children_src,
-    ffi::AnyBuffer nquery_recv,
-    ffi::AnyBuffer nquery_src,
+    ffi::AnyBuffer weights_recv,
+    ffi::AnyBuffer weights_src,
     ffi::AnyBuffer spl_ilist_child,
     ffi::AnyBuffer opening_criterion_params,
     ffi::Result<ffi::AnyBuffer> child_ilist_out,
@@ -242,8 +242,8 @@ ffi::Error InsertInteractionsFFIHost(
     void* ilist_isrc_arg = ilist_isrc.untyped_data();
     void* children_recv_arg = children_recv.untyped_data();
     void* children_src_arg = children_src.untyped_data();
-    void* nquery_recv_arg = nquery_recv.untyped_data();
-    void* nquery_src_arg = nquery_src.untyped_data();
+    void* weights_recv_arg = weights_recv.untyped_data();
+    void* weights_src_arg = weights_src.untyped_data();
     void* spl_ilist_child_arg = spl_ilist_child.untyped_data();
     void* opening_criterion_params_arg = opening_criterion_params.untyped_data();
     void* child_ilist_out_arg = child_ilist_out->untyped_data();
@@ -255,8 +255,8 @@ ffi::Error InsertInteractionsFFIHost(
         &ilist_isrc_arg,
         &children_recv_arg,
         &children_src_arg,
-        &nquery_recv_arg,
-        &nquery_src_arg,
+        &weights_recv_arg,
+        &weights_src_arg,
         &spl_ilist_child_arg,
         &opening_criterion_params_arg,
         &child_ilist_out_arg
@@ -318,8 +318,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // ilist_isrc
         .Arg<ffi::AnyBuffer>() // children_recv
         .Arg<ffi::AnyBuffer>() // children_src
-        .Arg<ffi::AnyBuffer>() // nquery_recv
-        .Arg<ffi::AnyBuffer>() // nquery_src
+        .Arg<ffi::AnyBuffer>() // weights_recv
+        .Arg<ffi::AnyBuffer>() // weights_src
         .Arg<ffi::AnyBuffer>() // spl_ilist_child
         .Arg<ffi::AnyBuffer>() // opening_criterion_params
         .Ret<ffi::AnyBuffer>() // child_ilist_out

@@ -122,7 +122,7 @@ plt.show()
 
 ## Kernel density estimates
 
-The same machinery evaluates densities with the compactly supported `WendlandC2Kernel`. Combined with `OpeningBySupport`, the tree walk only opens node pairs closer than the support radius and evaluates all of their interactions by direct summation, so the result is exact and a low multipole order suffices. `evaluate_at_positions` evaluates the result at arbitrary query positions and skips all interactions that do not involve a query. The returned potential is the density, and its gradient is available from `loc.values[:, 1:]`:
+The same machinery evaluates densities with the compactly supported `WendlandC2Kernel`. Combined with `OpeningBySupport`, the tree walk only opens node pairs closer than the support radius and evaluates all of their interactions by direct summation, so the result is exact and a low multipole order suffices. `evaluate_at_positions` evaluates the result at arbitrary query positions. Sources and queries are sorted into one tree as separate particle types, and only interactions from the sources onto the queries are evaluated. The returned potential is the density, and its gradient is available from `loc.values[:, 1:]`:
 
 ```python
 support = 0.02
